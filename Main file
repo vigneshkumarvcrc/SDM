@@ -1,0 +1,1611 @@
+# ============================================================================
+# 0.  LIBRARIES
+# ============================================================================
+
+library(raster)
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(pROC)
+library(randomForest)
+library(gbm)
+library(earth)
+library(usdm)
+library(blockCV)
+library(dismo)
+library(rJava)
+library(ggplot2)
+library(corrplot)
+library(spdep)
+library(spatstat.explore)
+library(spatstat.geom)
+library(caret)
+library(patchwork)
+
+# Namespace conflict resolution
+extract   <- terra::extract
+resample  <- terra::resample
+aggregate <- terra::aggregate
+crop      <- terra::crop
+mask      <- terra::mask
+values    <- terra::values
+
+# Plot saving -----------------------------------------------------------------
+DPI <- 500
+
+save_gg <- function(plot_obj, filename, width = 8, height = 6, dpi = DPI) {
+  tryCatch(
+    ggsave(filename = filename, plot = plot_obj,
+           width = width, height = height, units = "in", dpi = dpi, bg = "white"),
+    error = function(e) cat("  Plot error [", basename(filename), "]:", e$message, "\n"))
+  cat("  Saved:", basename(filename), "\n")
+}
+
+save_base <- function(filename, width = 8, height = 8, dpi = DPI, expr) {
+  png(filename, width = width, height = height, units = "in", res = dpi)
+  tryCatch({ force(expr); invisible(NULL) },
+           error   = function(e) cat("  Plot error [", basename(filename), "]:", e$message, "\n"),
+           finally = { if (dev.cur() > 1) dev.off() })
+  cat("  Saved:", basename(filename), "\n")
+}
+
+
+# ============================================================================
+# 1.  PATHS + SETTINGS
+# ============================================================================
+
+SPECIES     <- "turturis"   # "spinigera" or "turturis" — ALSO change SPECIES_CSV below
+SPECIES_CSV <- dir
+
+out <- dir
+dir.create(out, showWarnings = FALSE, recursive = TRUE)
+out_rand <- paste0(out, "RandomBG/")
+
+MODEL_NAMES   <- c("GLM", "RF", "BRT", "MARS", "MaxEnt")
+MIN_PRES_FOLD <- 3
+N_BG          <- 1000
+KDE_EPS       <- 0.01    # KDE is rescaled to max = 1; weight = 1/(kde_norm + KDE_EPS)
+# (unit-independent; max weight ratio = 1/KDE_EPS)
+UTM_CRS       <- "EPSG:32643"   # projected CRS for KDE (Western Ghats ~ UTM 43N)
+HIGH_SUIT     <- 0.7     # operational "high suitability" cut-off (relative index)
+SD_PRIMARY    <- 0.10    # operational inter-model SD cut-off
+BUFFER_M <- 0   # metres. 0 = plain spatial-block CV (NO exclusion buffer). Set e.g. 101390 to REMOVE, per fold,
+# all training points lying within BUFFER_M of any test point (buffered/purged spatial CV).
+BLOCK_SIZE_OVERRIDE_M <- NULL  # e.g. 100000 to impose a user-specified block size (metres);
+# leave NULL to estimate it from predictor autocorrelation
+
+ALLOW_CSV_NAME_MISMATCH <- TRUE
+if (!isTRUE(ALLOW_CSV_NAME_MISMATCH) && !grepl(substr(SPECIES, 1, 4), basename(SPECIES_CSV), ignore.case = TRUE))
+  stop("SPECIES = '", SPECIES, "' but SPECIES_CSV = '", basename(SPECIES_CSV), "'. Point SPECIES_CSV to this species' file ",
+       "(or set ALLOW_CSV_NAME_MISMATCH <- TRUE if the file name is legitimately different).")
+cat("Species         :", SPECIES, "\n")
+cat("Output directory:", out, "\n")
+
+# MaxEnt jar
+jar_path <- dir
+options(dismo.maxent = jar_path)
+if (!file.exists(jar_path)) stop("maxent.jar not found: ", jar_path)
+
+
+# ============================================================================
+# 3.  LOAD RASTERS
+# ============================================================================
+
+cat("\n[1/9] Loading rasters...\n")
+pdir <- dir
+
+prec          <- rast(paste0(pdir, "mean_prec_2021_2023_all_months.tif"))
+tmean         <- rast(paste0(pdir, "tmean_2021_2023_all_months.tif"))
+slope         <- rast(paste0(pdir, "Slope.tif"))
+ndvi          <- rast(paste0(pdir, "mean_ndvi_2021_2023_1km.tif"))
+elev          <- rast(paste0(pdir, "wc_elev.tif"))
+dew           <- rast(paste0(pdir, "dewpoint_2021_2023.tif"))
+solar         <- rast(paste0(pdir, "Solar_2021_2023.tif"))
+press         <- rast(paste0(pdir, "Pressure_2021_2023.tif"))
+temp2m        <- rast(paste0(pdir, "temperature_2m_2021_2023.tif"))
+hii           <- rast(paste0(pdir, "hii_2020-01-01.tif"))
+dist_forest   <- rast(paste0(pdir, "dist_forest_1km.tif"))
+livestock_raw <- rast(paste0(pdir, "GLW4-2020.D-DA.GLEAM3-ALL-LU.tif"))
+
+cat("  IMPORTANT: verify precipitation source/temporal coverage for Table S1\n")
+
+# Native resolution audit
+rast_raw <- list(prec=prec, tmean=tmean, slope=slope, ndvi=ndvi, elev=elev,
+                 dew=dew, solar=solar, press=press, temp2m=temp2m,
+                 hii=hii, dist_forest=dist_forest, livestock=livestock_raw)
+res_native <- data.frame(
+  Layer   = names(rast_raw),
+  Source  = c("WorldClim/ERA5","WorldClim","SRTM/ASTER","MODIS","SRTM/ASTER",
+              "ERA5","ERA5","ERA5","ERA5","HII 2020","Derived/Hansen","FAO GLW4 2020"),
+  Type    = rep("continuous", 12),
+  Res_deg = sapply(rast_raw, function(x) round(res(x)[1], 6)),
+  Res_km  = sapply(rast_raw, function(x) round(res(x)[1] * 111, 2)))
+res_native$Harmonised_grid_km <- 1
+res_native$Effective_resolution_note <- ifelse(res_native$Res_km > 1.5,
+                                               "Coarser than 1-km grid: bilinear resampling gives a common grid but NO new fine-scale information",
+                                               "~1 km or finer (aggregated/resampled to 1 km)")
+print(res_native)
+write.csv(res_native, paste0(out, "Resolution_audit_native.csv"), row.names = FALSE)
+
+
+# ============================================================================
+# 5.  RESOLUTION HARMONISATION TO 1 km
+# ============================================================================
+
+cat("\n[2/9] Harmonising to 1 km...\n")
+template <- ndvi
+
+aggregate_to_1km <- function(r, tmpl, fun = "mean") {
+  if (res(r)[1] < res(tmpl)[1]) {
+    fact <- max(1L, round(res(tmpl)[1] / res(r)[1]))
+    cat("  aggregate:", names(r), "| factor =", fact, "\n")
+    r <- aggregate(r, fact = fact, fun = fun)
+  }
+  resample(r, tmpl, method = "bilinear")
+}
+
+slope_1km  <- aggregate_to_1km(slope, template)
+elev_1km   <- aggregate_to_1km(elev,  template)
+dew_1km    <- resample(dew,    template, method = "bilinear")
+solar_1km  <- resample(solar,  template, method = "bilinear")
+press_1km  <- resample(press,  template, method = "bilinear")
+temp2m_1km <- resample(temp2m, template, method = "bilinear")
+prec_1km   <- resample(prec,   template, method = "bilinear")
+tmean_1km  <- resample(tmean,  template, method = "bilinear")
+hii_1km    <- resample(hii,    template, method = "bilinear")
+dist_forest_1km <- resample(dist_forest, template, method = "bilinear")
+livestock_1km   <- log1p(resample(livestock_raw, template, method = "bilinear"))
+
+env <- c(prec_1km, tmean_1km, slope_1km, elev_1km, dew_1km, solar_1km,
+         press_1km, temp2m_1km, ndvi, hii_1km, dist_forest_1km, livestock_1km)
+names(env) <- c("Precipitation","Mean_Temperature","Slope","Elevation",
+                "Dewpoint","Solar_radiation","Pressure","Temp_2m",
+                "NDVI","HII","Dist_Forest","Livestock_Density")
+ALL_VARS <- names(env)
+
+
+# ============================================================================
+# 6.  MASK TO WESTERN GHATS (+ explicit CRS handling)
+# ============================================================================
+
+cat("\n[3/9] Masking to study area...\n")
+
+wg <- st_read(dir,
+              quiet = TRUE)
+cat("  Raster CRS is lon/lat:", is.lonlat(env), "\n")
+if (st_crs(wg) != st_crs(crs(env))) {
+  cat("  Reprojecting WG polygon to raster CRS\n")
+  wg <- st_transform(wg, st_crs(crs(env)))
+}
+env <- crop(env, vect(wg))
+env <- mask(env, vect(wg))
+
+
+# ============================================================================
+# 7.  OCCURRENCE DATA (read as EPSG:4326, projected to raster CRS)
+# ============================================================================
+
+cat("\n[4/9] Loading occurrence data...\n")
+
+data_csv <- read.csv(SPECIES_CSV)
+if (!all(c("longitude","latitude","presence") %in% names(data_csv)))
+  stop("CSV must contain: longitude, latitude, presence")
+data_csv <- data_csv[complete.cases(data_csv[, c("longitude","latitude","presence")]), ]
+
+# ---- Explicit inclusion rule + exclusion audit (Issue A) ----
+# Rule: a record is INCLUDED iff (1) it falls inside the Western Ghats polygon AND
+#       (2) it has complete values for all predictors. Everything else is documented, not silently dropped.
+n_raw      <- nrow(data_csv)
+n_pres_raw <- sum(data_csv$presence == 1); n_nondet_raw <- sum(data_csv$presence == 0)
+cat("  Records read:", n_raw, "| presences:", n_pres_raw, "| non-detections:", n_nondet_raw, "\n")
+
+wg_ll_union <- st_union(st_make_valid(st_transform(wg, 4326)))
+pts_ll      <- st_as_sf(data_csv, coords = c("longitude","latitude"), crs = 4326, remove = FALSE)
+data_csv$inside_WG <- lengths(st_intersects(pts_ll, wg_ll_union)) > 0
+
+occ_ll_all  <- vect(data_csv[, c("longitude","latitude")],
+                    geom = c("longitude","latitude"), crs = "EPSG:4326")
+occ_env_all <- project(occ_ll_all, crs(env))
+vals_all    <- terra::extract(env, occ_env_all)[, -1]
+data_csv$predictors_complete <- complete.cases(vals_all)
+
+data_csv$status <- ifelse(!data_csv$inside_WG, "Excluded: outside WG polygon",
+                          ifelse(!data_csv$predictors_complete, "Excluded: inside WG but missing predictor value",
+                                 "Included"))
+audit <- as.data.frame(table(Status = data_csv$status,
+                             Record = ifelse(data_csv$presence == 1, "Presence", "Non-detection")),
+                       responseName = "N")
+audit_wide <- tidyr::pivot_wider(audit, names_from = Record, values_from = N, values_fill = 0)
+audit_wide$Total <- rowSums(audit_wide[, setdiff(names(audit_wide), "Status")])
+cat("\n  === RECORD INCLUSION AUDIT ===\n"); print(as.data.frame(audit_wide), row.names = FALSE)
+write.csv(audit_wide, paste0(out, "Record_inclusion_audit.csv"), row.names = FALSE)
+if (any(data_csv$status != "Included")) {
+  write.csv(data_csv[data_csv$status != "Included", ], paste0(out, "Records_excluded.csv"), row.names = FALSE)
+  cat("  ", sum(data_csv$status != "Included"), "record(s) excluded - see Records_excluded.csv.",
+      "CHECK the survey design before accepting this exclusion.\n")
+}
+data_csv_all <- data_csv                       # keep full set for the map / audit
+use          <- data_csv$status == "Included"
+data_csv     <- data_csv[use, ]
+occ_env      <- occ_env_all[use]
+vals         <- vals_all[use, , drop = FALSE]
+
+n_pres   <- sum(data_csv$presence == 1)
+n_nondet <- sum(data_csv$presence == 0)
+cat("  Included presences      :", n_pres, "\n")
+cat("  Included non-detections :", n_nondet, "\n")
+cat("  VERIFY: presence == 0 must mean 'surveyed for and not detected'.\n",
+    "         If it only means 'no record', keep the term 'unrecorded' and\n",
+    "         state so in Methods.\n")
+
+xy_env <- crds(occ_env)
+data_real <- data.frame(
+  x = xy_env[,1], y = xy_env[,2],
+  presence = data_csv$presence,
+  src = ifelse(data_csv$presence == 1, "Field presence", "Field non-detection"),
+  vals)
+
+# Sampling map: ALL records, excluded ones shown distinctly
+occ_sf <- st_as_sf(data_csv_all, coords = c("longitude","latitude"), crs = 4326)
+occ_sf$Type <- factor(ifelse(occ_sf$status != "Included", "Excluded record",
+                             ifelse(occ_sf$presence == 1, "Presence", "Non-detection (field survey)")),
+                      levels = c("Presence","Non-detection (field survey)","Excluded record"))
+wg_sf <- st_transform(wg, 4326)
+
+p_sampling <- ggplot() +
+  geom_sf(data = wg_sf, fill = "grey95", colour = "grey50") +
+  geom_sf(data = occ_sf, aes(colour = Type, shape = Type, size = Type), alpha = 0.75) +
+  scale_colour_manual(values = c("Presence" = "#d73027",
+                                 "Non-detection (field survey)" = "#4575b4",
+                                 "Excluded record" = "black"), drop = FALSE) +
+  scale_shape_manual(values = c(16, 3, 4), drop = FALSE) +
+  scale_size_manual(values = c(2.5, 1.5, 2.5), drop = FALSE) +
+  labs(title    = bquote(italic("H.")~.(SPECIES)~"— Sampling Locations"),
+       subtitle = paste0("Included presences: ", n_pres, "  |  Included non-detections: ", n_nondet,
+                         "  |  Excluded: ", sum(data_csv_all$status != "Included"),
+                         "  |  Field surveys 2021-2023"),
+       colour = NULL, shape = NULL, size = NULL) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+save_gg(p_sampling, paste0(out, "Sampling_locations.png"), width = 7, height = 9)
+
+
+# ============================================================================
+# 8.  BACKGROUND SAMPLING
+#     Primary  : inverse-KDE (bias-corrected), KDE estimated inside the real
+#                WG polygon in a projected CRS
+#     Sensitivity: uniform random
+# ============================================================================
+
+cat("\n[5/9] Background sampling...\n")
+
+sample_bg <- function(w_rast, n, src, seed) {
+  set.seed(seed)
+  wv <- values(w_rast, mat = FALSE)
+  ok <- which(!is.na(wv) & wv > 0)
+  idx <- sample(ok, n, replace = FALSE, prob = wv[ok])
+  xy  <- xyFromCell(w_rast, idx)
+  pv  <- vect(xy, type = "points", crs = crs(env))
+  ev  <- terra::extract(env, pv)[, -1]
+  data.frame(x = xy[,1], y = xy[,2], presence = 0, src = src, ev)
+}
+
+# --- KDE in projected CRS inside WG polygon ---
+wg_utm     <- project(vect(wg), UTM_CRS)
+r_tmpl_utm <- rast(ext(wg_utm), resolution = 1000, crs = UTM_CRS)
+m_rast     <- rasterize(wg_utm, r_tmpl_utm, field = 1, background = NA)
+m_mat      <- !is.na(as.matrix(m_rast, wide = TRUE))
+m_mat      <- m_mat[nrow(m_mat):1, , drop = FALSE]      # spatstat: y increasing
+ev_utm     <- as.vector(ext(r_tmpl_utm))                 # xmin,xmax,ymin,ymax
+kde_win    <- owin(xrange = ev_utm[1:2], yrange = ev_utm[3:4], mask = m_mat)
+
+pres_utm <- crds(project(vect(data_real[data_real$presence == 1, c("x","y")],
+                              geom = c("x","y"), crs = crs(env)), UTM_CRS))
+kde_ppp  <- ppp(x = pres_utm[,1], y = pres_utm[,2], window = kde_win)
+cat("  Presences inside KDE window:", kde_ppp$n, "of", nrow(pres_utm), "\n")
+kde_sig  <- as.numeric(bw.diggle(kde_ppp))
+cat("  KDE bandwidth (m):", round(kde_sig, 0), "\n")
+kde_im   <- density(kde_ppp, sigma = kde_sig)
+
+kde_mat  <- kde_im$v[nrow(kde_im$v):1, , drop = FALSE]
+kde_utm  <- rast(kde_mat, extent = ext(c(kde_im$xrange, kde_im$yrange)), crs = UTM_CRS)
+kde_env  <- project(kde_utm, env[[1]], method = "bilinear")
+kde_env  <- mask(kde_env, vect(wg))
+kde_norm <- kde_env / global(kde_env, "max", na.rm = TRUE)[[1]]
+kde_w    <- 1 / (kde_norm + KDE_EPS)
+kde_w    <- mask(kde_w, env[[1]])
+
+writeLines(c(
+  "LIMITATION (for Methods/Discussion):",
+  "The sampling-bias surface used for background generation was derived from the complete occurrence dataset and was held constant across spatial cross-validation folds."),
+  paste0(out, "Limitations_note.txt"))
+bg_kde  <- sample_bg(kde_w, N_BG, "Background (KDE)", seed = 123)
+
+rand_w  <- ifel(is.na(env[[1]]), NA, 1)
+bg_rand <- sample_bg(rand_w, N_BG, "Background (random)", seed = 456)
+
+data_all      <- na.omit(rbind(data_real, bg_kde))
+data_all_rand <- na.omit(rbind(data_real, bg_rand))
+# Count records after complete-case filtering
+n_final <- nrow(data_all)
+n_bg_retained <- n_final - nrow(data_real)
+
+cat("  Background requested:", N_BG, "\n")
+cat("  Background retained :", n_bg_retained, "\n")
+cat("  Background excluded :", N_BG - n_bg_retained, "\n")
+cat("  Final dataset       :", n_final, "\n")
+
+write.csv(
+  data.frame(
+    Component = c(
+      "Field presences",
+      "Field non-detections",
+      "KDE background requested",
+      "KDE background retained",
+      "KDE background excluded",
+      "Final dataset"
+    ),
+    N = c(
+      n_pres,
+      n_nondet,
+      N_BG,
+      n_bg_retained,
+      N_BG - n_bg_retained,
+      n_final
+    )
+  ),
+  paste0(out, "Dataset_composition.csv"),
+  row.names = FALSE
+)
+
+cat("  Primary dataset (KDE)  :", nrow(data_all), "rows\n")
+cat("  Sensitivity (random)   :", nrow(data_all_rand), "rows\n")
+write.csv(data.frame(
+  Component = c("Field presences","Field non-detections","KDE background (requested)",
+                "Total after na.omit"),
+  N = c(n_pres, n_nondet, N_BG, nrow(data_all)),
+  Note = c("", "", "",
+           "Model framework: presence vs (field non-detections + background) = 0")),
+  paste0(out, "Dataset_composition.csv"), row.names = FALSE)
+
+
+# ============================================================================
+# 9.  DESCRIPTIVE CORRELATION MATRIX (not used for selection)
+# ============================================================================
+
+cat("\n[6/9] Correlation matrix (descriptive)...\n")
+cor_mat <- cor(data_all[, ALL_VARS], use = "complete.obs")
+save_base(paste0(out, "Correlation_matrix.png"), 8, 8, 500, {
+  corrplot(cor_mat, method = "color", type = "upper",
+           col = colorRampPalette(c("#2166ac","white","#b2182b"))(200),
+           addCoef.col = "black", number.cex = 0.75, tl.cex = 0.9,
+           tl.col = "black", tl.srt = 45, cl.cex = 0.8,
+           title = "Pearson Correlation Matrix (all predictors, descriptive)",
+           mar = c(0,0,2,0))
+})
+write.csv(as.data.frame(cor_mat), paste0(out, "Correlation_matrix.csv"))
+
+
+# ============================================================================
+# 12. SPATIAL BLOCK SIZE (predictor autocorrelation range; no occurrence data)
+# ============================================================================
+
+cat("\nEstimating spatial-autocorrelation range of predictors...\n")
+
+# Internal fallback estimator: empirical semivariogram of ONE predictor layer in a projected CRS,
+# spherical model fitted by nls; returns the fitted range (metres). Predictors only.
+own_range <- function(r1, n = 3000, nbins = 20, seed = 1) {
+  tryCatch({
+    set.seed(seed)
+    smp <- terra::spatSample(r1, n, method = "random", na.rm = TRUE, xy = TRUE, values = TRUE)
+    if (nrow(smp) < 300) return(list(range = NA_real_, flag = "too few cells"))
+    xy <- if (is.lonlat(r1)) crds(project(vect(smp[, c("x","y")], geom = c("x","y"), crs = crs(r1)), UTM_CRS))
+    else as.matrix(smp[, c("x","y")])
+    z <- as.numeric(smp[[3]]); if (sd(z) == 0) return(list(range = NA_real_, flag = "constant layer"))
+    z <- (z - mean(z)) / sd(z)
+    d <- as.numeric(dist(xy)); g <- as.numeric(0.5 * dist(z)^2)
+    cutoff <- max(d) / 3
+    keep <- d > 0 & d <= cutoff
+    b <- cut(d[keep], breaks = seq(0, cutoff, length.out = nbins + 1), include.lowest = TRUE)
+    vg <- data.frame(h = tapply(d[keep], b, mean), gamma = tapply(g[keep], b, mean))
+    vg <- vg[complete.cases(vg), ]
+    sph <- function(h, nug, sill, a) ifelse(h < a, nug + (sill - nug) * (1.5 * h / a - 0.5 * (h / a)^3), sill)
+    fit <- nls(gamma ~ sph(h, nug, sill, a), data = vg,
+               start = list(nug = 0.05, sill = max(vg$gamma), a = cutoff / 2),
+               algorithm = "port", lower = c(0, 0, min(vg$h)), upper = c(2, 3, cutoff))
+    a <- as.numeric(coef(fit)["a"])
+    flag <- if (a >= 0.98 * cutoff) "at upper bound (sill not reached within cutoff; range unreliable)"
+    else if (a <= 1.02 * min(vg$h)) "at lower bound (range unreliable)" else "ok"
+    list(range = a, flag = flag)
+  }, error = function(e) list(range = NA_real_, flag = paste("fit failed:", substr(e$message, 1, 80))))
+}
+
+ext_diag <- sqrt((ev_utm[2] - ev_utm[1])^2 + (ev_utm[4] - ev_utm[3])^2)   # study-area diagonal (m)
+
+est_block_size <- function() {
+  lay <- names(env)
+  stat <- data.frame(Layer = lay, blockCV_stack_m = NA_real_, blockCV_layer_m = NA_real_,
+                     internal_variogram_m = NA_real_, blockCV_layer_error = NA_character_)
+  finish <- function(rng, source) list(size = median(rng, na.rm = TRUE), source = source, stat = stat, ranges = rng,
+                                       n_ok = sum(is.finite(rng)))
+  min_ok <- max(3, ceiling(length(lay) / 2))
+  
+  # Tier 1: blockCV on the whole predictor stack
+  t1 <- tryCatch(blockCV::cv_spatial_autocor(r = env, num_sample = 5000, plot = FALSE, progress = FALSE),
+                 error = function(e) { cat("  Tier 1 (stack) failed:", e$message, "\n"); NULL })
+  if (!is.null(t1) && is.finite(as.numeric(t1$range))) {
+    rt <- t1$range_table
+    if (!is.null(rt)) { stat$blockCV_stack_m[match(as.character(rt[[1]]), lay)] <- rt[[ncol(rt)]]
+    write.csv(rt, paste0(out, "Autocorrelation_range_table.csv"), row.names = FALSE) }
+    return(c(finish(if (!is.null(rt)) rt[[ncol(rt)]] else as.numeric(t1$range),
+                    "cv_spatial_autocor() on predictor stack"), list(size_override = as.numeric(t1$range))))
+  }
+  # Tier 2: blockCV layer by layer (isolates problem layers)
+  for (k in seq_along(lay)) {
+    stat$blockCV_layer_m[k] <- tryCatch(
+      as.numeric(blockCV::cv_spatial_autocor(r = env[[k]], num_sample = 5000, plot = FALSE,
+                                             progress = FALSE)$range),
+      error = function(e) { stat$blockCV_layer_error[k] <<- substr(e$message, 1, 120); NA_real_ })
+  }
+  stat$blockCV_layer_raw_m <- stat$blockCV_layer_m
+  bad <- is.finite(stat$blockCV_layer_m) & stat$blockCV_layer_m > ext_diag     # range larger than the study area: not usable
+  if (any(bad)) cat("  Tier 2: discarding layer ranges > study-area diagonal:", paste(lay[bad], collapse = ", "), "\n")
+  stat$blockCV_layer_m[bad] <- NA
+  if (sum(is.finite(stat$blockCV_layer_m)) >= min_ok) {
+    write.csv(stat, paste0(out, "Autocorrelation_range_table.csv"), row.names = FALSE)
+    return(finish(stat$blockCV_layer_m, sprintf("cv_spatial_autocor() per layer (median of %d/%d layers)",
+                                                sum(is.finite(stat$blockCV_layer_m)), length(lay))))
+  }
+  # Tier 3: internal empirical-variogram estimator
+  cat("  Tier 2 insufficient; using internal variogram estimator\n")
+  ov <- lapply(seq_along(lay), function(k) own_range(env[[k]]))
+  stat$internal_variogram_m <- sapply(ov, function(o) o$range)
+  stat$internal_flag        <- sapply(ov, function(o) o$flag)
+  print(stat[, c("Layer", "internal_variogram_m", "internal_flag")])
+  write.csv(stat, paste0(out, "Autocorrelation_range_table.csv"), row.names = FALSE)
+  if (sum(is.finite(stat$internal_variogram_m)) >= min_ok)
+    return(finish(stat$internal_variogram_m, sprintf("internal spherical-variogram fit per layer (median of %d/%d layers)",
+                                                     sum(is.finite(stat$internal_variogram_m)), length(lay))))
+  write.csv(stat, paste0(out, "Autocorrelation_range_table.csv"), row.names = FALSE)
+  list(size = NA_real_, source = "none (all autocorrelation estimators failed)", stat = stat, n_ok = 0)
+}
+
+if (!is.null(BLOCK_SIZE_OVERRIDE_M)) {
+  block_size_m   <- as.numeric(BLOCK_SIZE_OVERRIDE_M)
+  block_src      <- "user-specified block size (BLOCK_SIZE_OVERRIDE_M)"
+} else {
+  bs <- est_block_size()
+  block_size_m <- if (is.finite(bs$size)) as.numeric(bs$size) else NA_real_
+  block_src    <- bs$source
+  rng_all <- bs$ranges   # ONLY the values that produced the chosen block size
+  write.csv(data.frame(Statistic = c("source", "median (candidate block size, m)", "min (m)", "max (m)", "n_layers_estimated"),
+                       Value = c(block_src, block_size_m, suppressWarnings(min(rng_all, na.rm = TRUE)),
+                                 suppressWarnings(max(rng_all, na.rm = TRUE)), bs$n_ok)),
+            paste0(out, "Autocorrelation_range_summary.csv"), row.names = FALSE)
+}
+BLOCK_METHOD_USED <- if (is.finite(block_size_m)) {
+  paste0("Block size from predictor autocorrelation: ", block_src, " (no occurrence data)")
+} else {
+  "Spatial block CV via blockCV::cv_spatial() WITHOUT an autocorrelation-derived block size (estimation failed)"
+}
+cat("  Block-size method:", BLOCK_METHOD_USED, "\n")
+cat("  Candidate block size:", ifelse(is.finite(block_size_m), paste(round(block_size_m / 1000, 1), "km"), "NA"), "\n")
+
+
+# ============================================================================
+# 13. HELPERS
+# ============================================================================
+
+omission_rate <- function(obs, pred, threshold) {
+  pres <- obs == 1
+  if (sum(pres) == 0) return(NA_real_)
+  1 - mean(as.integer(pred[pres] >= threshold))
+}
+brt_ntrees <- function(mod, requested = 2000) {
+  actual <- tryCatch(mod$n.trees, error = function(e) requested)
+  min(requested, actual)
+}
+safe_pred <- function(expr, n) tryCatch(expr, error = function(e) rep(NA_real_, n))
+try_fit   <- function(expr, nm) tryCatch(expr, error = function(e) { cat("   ", nm, "failed:", e$message, "\n"); NULL })
+
+# Fold-internal preprocessing: VIF + scaling from TRAINING rows only (R1)
+prep_fold <- function(train_df, test_df) {
+  vif_res <- usdm::vifstep(train_df[, ALL_VARS], th = 5)
+  v   <- as.character(vif_res@results$Variables)
+  mu  <- colMeans(train_df[, v, drop = FALSE], na.rm = TRUE)
+  sdv <- apply(train_df[, v, drop = FALSE], 2, sd, na.rm = TRUE)
+  keep <- sdv > 0
+  if (any(!keep)) cat("    Zero SD dropped:", paste(v[!keep], collapse = ", "), "\n")
+  v <- v[keep]; mu <- mu[v]; sdv <- sdv[v]
+  sc <- function(df) {
+    o <- df[, v, drop = FALSE]
+    for (nm in v) o[[nm]] <- (o[[nm]] - unname(mu[nm])) / unname(sdv[nm])
+    o
+  }
+  list(vars = v, mu = mu, sd = sdv, vif = vif_res,
+       train_sc = cbind(presence = train_df$presence, sc(train_df)),
+       test_sc  = cbind(presence = test_df$presence,  sc(test_df)))
+}
+
+fit_models <- function(train_sc, train_raw, vars, mx_dir, full = FALSE) {
+  dir.create(mx_dir, showWarnings = FALSE, recursive = TRUE)
+  mx_args <- c("outputformat=logistic", "betamultiplier=1", "threads=2",
+               if (full) c("responsecurves=true", "jackknife=true"))
+  fm <- list(
+    glm  = try_fit(glm(presence ~ ., data = train_sc, family = binomial), "GLM"),
+    rf   = try_fit(randomForest(as.factor(presence) ~ ., data = train_sc,
+                                importance = TRUE, ntree = 500), "RF"),
+    brt  = try_fit(gbm(presence ~ ., data = train_sc, distribution = "bernoulli",
+                       n.trees = 2000, interaction.depth = 3, shrinkage = 0.01,
+                       bag.fraction = 0.75, verbose = FALSE), "BRT"),
+    mars = try_fit(earth(presence ~ ., data = train_sc,
+                         glm = list(family = binomial), degree = 2, nprune = 15), "MARS"),
+    # MaxEnt uses RAW predictor units (documented) and no coordinates
+    mx   = try_fit(maxent(x = train_raw[, vars, drop = FALSE], p = train_sc$presence,
+                          path = mx_dir, args = mx_args), "MaxEnt"))
+  fm$brt_n <- if (!is.null(fm$brt)) brt_ntrees(fm$brt) else NA
+  fm
+}
+
+predict_models <- function(fm, sc_df, raw_df, vars) {
+  n <- nrow(sc_df); p <- setNames(vector("list", 5), MODEL_NAMES)
+  na <- rep(NA_real_, n)
+  p$GLM  <- if (!is.null(fm$glm))  safe_pred(as.numeric(predict(fm$glm, sc_df, type = "response")), n) else na
+  p$RF   <- if (!is.null(fm$rf))   safe_pred(as.numeric(predict(fm$rf, sc_df, type = "prob")[, "1"]), n) else na
+  p$BRT  <- if (!is.null(fm$brt))  safe_pred(as.numeric(predict(fm$brt, sc_df, n.trees = fm$brt_n, type = "response")), n) else na
+  p$MARS <- if (!is.null(fm$mars)) safe_pred(as.numeric(predict(fm$mars, sc_df, type = "response")), n) else na
+  p$MaxEnt <- if (!is.null(fm$mx)) safe_pred(as.numeric(predict(fm$mx, raw_df[, vars, drop = FALSE])), n) else na
+  p
+}
+
+eval_metrics <- function(obs, pred, model, fold) {
+  valid <- !is.na(pred) & !is.na(obs); pred <- pred[valid]; obs <- obs[valid]
+  if (length(unique(obs)) < 2 || sum(obs == 1) < MIN_PRES_FOLD || length(obs) < 10) return(NULL)
+  roc_obj <- tryCatch(pROC::roc(obs, pred, levels = c(0L, 1L), direction = "<",
+                                ci = TRUE, quiet = TRUE), error = function(e) NULL)
+  if (is.null(roc_obj)) return(NULL)
+  best <- tryCatch(pROC::coords(roc_obj, "best", ret = c("threshold","sensitivity","specificity"),
+                                transpose = FALSE), error = function(e) NULL)
+  if (is.null(best) || nrow(best) == 0) return(NULL)
+  ci  <- as.numeric(pROC::ci(roc_obj))
+  sens <- best$sensitivity[1]; spec <- best$specificity[1]; thr <- best$threshold[1]
+  pb <- factor(as.integer(pred >= thr), levels = c(0L, 1L)); ob <- factor(obs, levels = c(0L, 1L))
+  cm <- tryCatch(caret::confusionMatrix(pb, ob, positive = "1"), error = function(e) NULL)
+  row <- data.frame(Model = model, Fold = fold,
+                    AUC = round(as.numeric(pROC::auc(roc_obj)), 4),
+                    AUC_lower = round(ci[1], 4), AUC_upper = round(ci[3], 4),
+                    Sensitivity = round(sens, 4), Specificity = round(spec, 4),
+                    TSS_opt = round(sens + spec - 1, 4),   # threshold optimised on same predictions: NOT independent
+                    
+                    OmissionRate = round(omission_rate(obs, pred, thr), 4),
+                    Kappa = round(if (!is.null(cm)) as.numeric(cm$overall["Kappa"]) else NA_real_, 4),
+                    Threshold = round(thr, 4))
+  rc <- tryCatch(pROC::ci.se(roc_obj, specificities = seq(0, 1, 0.01), quiet = TRUE),
+                 error = function(e) NULL)
+  roc_df <- if (!is.null(rc)) data.frame(Model = model, Fold = fold,
+                                         Specificity = seq(0, 1, 0.01),
+                                         Se_lower = rc[,1], Sensitivity = rc[,2],
+                                         Se_upper = rc[,3]) else NULL
+  list(row = row, roc = roc_df)
+}
+
+ens_eval <- function(obs, pred) {
+  ok <- !is.na(pred)
+  if (sum(ok) < 10 || length(unique(obs[ok])) < 2) return(list(auc = NA, tss = NA, thr = NA))
+  r <- pROC::roc(obs[ok], pred[ok], levels = c(0, 1), direction = "<", quiet = TRUE)
+  b <- pROC::coords(r, "best", ret = c("threshold","sensitivity","specificity"), transpose = FALSE)
+  list(auc = as.numeric(pROC::auc(r)), tss = b$sensitivity[1] + b$specificity[1] - 1,
+       thr = b$threshold[1])
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x   # defined explicitly (not relying on base R >= 4.4)
+
+oof_ensemble <- function(oof, w, exclude = NULL) {
+  w2 <- w[colnames(oof)]
+  if (!is.null(exclude)) w2[colnames(oof) %in% exclude] <- 0
+  apply(oof, 1, function(x) {
+    ok <- !is.na(x) & w2 > 0
+    if (!any(ok)) NA_real_ else sum(x[ok] * w2[ok]) / sum(w2[ok])
+  })
+}
+
+# Leave-one-fold-out weights: weights for fold i use AUCs from the OTHER folds only
+lofo_weights <- function(results, i) {
+  w <- setNames(rep(0, 5), MODEL_NAMES)
+  r <- results[results$Fold != i, ]
+  if (nrow(r) > 0) { wm <- tapply(r$AUC, r$Model, mean, na.rm = TRUE); w[names(wm)] <- wm }
+  if (sum(w) == 0) w[] <- 1
+  w
+}
+oof_ensemble_lofo <- function(oof, folds, results, exclude = NULL) {
+  o <- rep(NA_real_, nrow(oof))
+  for (i in sort(unique(folds))) {
+    te <- which(folds == i)
+    o[te] <- oof_ensemble(oof[te, , drop = FALSE], lofo_weights(results, i), exclude)
+  }
+  o
+}
+
+make_ensemble <- function(maps, w, exclude = NULL) {
+  nm <- setdiff(names(maps), exclude)
+  ww <- w[nm]; if (sum(ww) == 0) ww[] <- 1; ww <- ww / sum(ww)
+  stk <- rast(maps[nm])
+  wt  <- Reduce("+", lapply(seq_along(nm), function(i) maps[[nm[i]]] * as.numeric(ww[i])))
+  list(wt = wt, mean = app(stk, mean, na.rm = TRUE), sd = app(stk, sd, na.rm = TRUE),
+       weights = ww)
+}
+
+
+# ============================================================================
+# 14. SCENARIO RUNNER  (spatial CV with leakage-free preprocessing,
+#     OOF predictions, final models, maps, ensemble)
+# ============================================================================
+
+run_scenario <- function(dat, tag, dir, plot_cv = FALSE) {
+  dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+  cat("\n==== Scenario:", tag, "| rows:", nrow(dat), "====\n")
+  set.seed(2026)
+  n <- nrow(dat)
+  is_field <- dat$src %in% c("Field presence", "Field non-detection")
+  
+  # ---- spatial folds FIRST (on raw data) ----
+  pts_sf <- st_as_sf(dat[, c("x","y","presence")], coords = c("x","y"), crs = crs(env))
+  sizes  <- if (is.finite(block_size_m)) block_size_m * c(1, 0.5, 0.25) else NA_real_
+  sb <- NULL; used_size <- NA_real_; attempted <- numeric(0)
+  for (s in sizes) {
+    attempted <- c(attempted, s)
+    sb <- tryCatch(
+      if (is.na(s)) cv_spatial(x = pts_sf, column = "presence", r = env, k = 5,
+                               selection = "random", iteration = 100, biomod2 = FALSE,
+                               progress = FALSE, report = FALSE, plot = FALSE)
+      else          cv_spatial(x = pts_sf, column = "presence", size = s, k = 5,
+                               selection = "random", iteration = 100, biomod2 = FALSE,
+                               progress = FALSE, report = FALSE, plot = FALSE),
+      error = function(e) { cat("  cv_spatial failed at size", round(s/1000, 1), "km:", e$message, "\n"); NULL })
+    if (!is.null(sb)) { used_size <- s; break }
+  }
+  if (is.null(sb)) stop("cv_spatial() failed for all block sizes")
+  folds <- sb$folds_ids
+  if (is.null(folds) || length(folds) != n || any(is.na(folds)) || any(folds == 0))
+    stop("Some observations were not assigned to spatial CV folds — investigate blockCV output.")
+  actual_size <- if (is.finite(used_size)) used_size else tryCatch(as.numeric(sb$size)[1], error = function(e) NA_real_)
+  cat("  Block size used:", round(actual_size / 1000, 2), "km | method:", BLOCK_METHOD_USED, "\n")
+  print(table(Fold = folds, Presence = dat$presence))
+  write.csv(data.frame(autocorr_range_m = block_size_m,
+                       autocorr_range_km = round(block_size_m / 1000, 2),
+                       attempted_sizes_km = paste(round(attempted / 1000, 2), collapse = " -> "),
+                       block_size_m = actual_size, block_size_km = round(actual_size/1000, 2),
+                       fallback_used = is.finite(block_size_m) && !isTRUE(all.equal(used_size, block_size_m)),
+                       autocorr_derived = is.finite(block_size_m),
+                       block_size_source = block_src,
+                       size_factor_used = round(actual_size / block_size_m, 3),
+                       buffer_m_applied = BUFFER_M,
+                       buffer_note = ifelse(BUFFER_M > 0, "per fold, training points within buffer of any test point were removed",
+                                            "NO exclusion buffer: blocks separate folds but nearest train-test distance can be < block size (see CV_fold_separation.csv)"),
+                       method = BLOCK_METHOD_USED),
+            paste0(dir, "CV_block_size.csv"), row.names = FALSE)
+  if (plot_cv) tryCatch({
+    save_gg(cv_plot(sb, x = pts_sf, r = raster::stack(env)), paste0(dir, "SpatialBlock_CV_map.png"), 7, 8)
+  }, error = function(e) cat("  cv_plot skipped:", e$message, "\n"))
+  
+  fold_comp <- do.call(rbind, lapply(1:5, function(i) data.frame(
+    Fold = i,
+    Train_pres = sum(dat$presence[folds != i] == 1), Train_zero = sum(dat$presence[folds != i] == 0),
+    Test_pres  = sum(dat$presence[folds == i] == 1), Test_zero  = sum(dat$presence[folds == i] == 0))))
+  write.csv(fold_comp, paste0(dir, "CV_fold_composition.csv"), row.names = FALSE)
+  
+  # distance matrix (projected metres) for buffering + separation diagnostics
+  xyp <- if (is.lonlat(env)) crds(project(vect(dat[, c("x","y")], geom = c("x","y"), crs = crs(env)), UTM_CRS))
+  else as.matrix(dat[, c("x","y")])
+  Dm  <- as.matrix(dist(xyp))
+  train_used <- vector("list", 5)
+  
+  # ---- CV loop ----
+  results <- data.frame(); roc_all <- data.frame(); fold_vars <- data.frame(); fold_status <- data.frame()
+  oof <- matrix(NA_real_, n, 5, dimnames = list(NULL, MODEL_NAMES))
+  
+  for (i in 1:5) {
+    cat("\n  -- Fold", i, "--\n")
+    tr <- which(folds != i); te <- which(folds == i)
+    n_purged <- 0
+    if (BUFFER_M > 0) {
+      dmin <- apply(Dm[tr, te, drop = FALSE], 1, min)
+      n_purged <- sum(dmin < BUFFER_M); tr <- tr[dmin >= BUFFER_M]
+      cat("    Buffer", BUFFER_M / 1000, "km: purged", n_purged, "training rows\n")
+    }
+    train_used[[i]] <- tr
+    train_raw <- dat[tr, ]; test_raw <- dat[te, ]
+    cat("    Train pres/zero:", sum(train_raw$presence == 1), "/", sum(train_raw$presence == 0),
+        "| Test pres/zero:", sum(test_raw$presence == 1), "/", sum(test_raw$presence == 0), "\n")
+    if (length(unique(train_raw$presence)) < 2 || length(unique(test_raw$presence)) < 2 ||
+        sum(train_raw$presence == 1) < MIN_PRES_FOLD || sum(test_raw$presence == 1) < MIN_PRES_FOLD) {
+      cat("    SKIP fold (insufficient classes/presences)\n")
+      fold_status <- rbind(fold_status, data.frame(Fold = i, Status = "SKIPPED",
+                                                   Reason = paste0("train pres=", sum(train_raw$presence == 1), ", train zero=", sum(train_raw$presence == 0),
+                                                                   ", test pres=", sum(test_raw$presence == 1), ", test zero=", sum(test_raw$presence == 0),
+                                                                   " (need both classes and >= ", MIN_PRES_FOLD, " presences in train and test)")))
+      next }
+    fold_status <- rbind(fold_status, data.frame(Fold = i, Status = "RUN", Reason = paste0("training rows purged by buffer: ", n_purged)))
+    
+    pf <- prep_fold(train_raw, test_raw)               # training-only VIF + scaling
+    cat("    Fold VIF-retained:", paste(pf$vars, collapse = ", "), "\n")
+    fold_vars <- rbind(fold_vars, data.frame(Fold = i, Variables = paste(pf$vars, collapse = ", ")))
+    
+    fm    <- fit_models(pf$train_sc, train_raw, pf$vars, paste0(dir, "maxent_cv/fold_", i, "/"))
+    preds <- predict_models(fm, pf$test_sc, test_raw, pf$vars)
+    
+    for (m in MODEL_NAMES) {
+      oof[te, m] <- preds[[m]]
+      em <- eval_metrics(as.integer(test_raw$presence), preds[[m]], m, i)
+      if (is.null(em)) { cat("    Skip metrics [", m, "]\n"); next }
+      results <- rbind(results, em$row)
+      if (!is.null(em$roc)) roc_all <- rbind(roc_all, em$roc)
+    }
+  }
+  write.csv(results,   paste0(dir, "Model_metrics_per_fold.csv"), row.names = FALSE)
+  write.csv(roc_all,   paste0(dir, "ROC_data_all_folds.csv"),     row.names = FALSE)
+  write.csv(fold_vars, paste0(dir, "CV_fold_VIF_variables.csv"),  row.names = FALSE)
+  
+  # ---- CV diagnostics (Issue D) ----
+  write.csv(fold_status[order(fold_status$Fold), ], paste0(dir, "CV_fold_status.csv"), row.names = FALSE)
+  if (any(fold_status$Status != "RUN"))
+    cat("  WARNING: folds not run:", paste(fold_status$Fold[fold_status$Status != "RUN"], collapse = ", "),
+        "- their rows have NO out-of-fold prediction (see CV_fold_status.csv)\n")
+  
+  validity <- data.frame(
+    Model = MODEL_NAMES,
+    n_oof_valid = as.integer(colSums(!is.na(oof))),
+    pct_rows_valid = round(100 * colMeans(!is.na(oof)), 1),
+    folds_with_metrics = sapply(MODEL_NAMES, function(m) length(unique(results$Fold[results$Model == m]))),
+    oof_min = suppressWarnings(round(apply(oof, 2, min, na.rm = TRUE), 4)),
+    oof_max = suppressWarnings(round(apply(oof, 2, max, na.rm = TRUE), 4)),
+    oof_sd  = round(apply(oof, 2, sd, na.rm = TRUE), 4))
+  validity$Flag <- ifelse(validity$folds_with_metrics < sum(fold_status$Status == "RUN"), "MODEL MISSING IN SOME FOLDS",
+                          ifelse(!is.finite(validity$oof_sd) | validity$oof_sd < 1e-6, "CONSTANT PREDICTIONS",
+                                 ifelse(validity$oof_min < 0 | validity$oof_max > 1, "OUTSIDE [0,1]", "ok")))
+  cat("\n  === OOF PREDICTION VALIDITY ===\n"); print(validity, row.names = FALSE)
+  write.csv(validity, paste0(dir, "CV_prediction_validity.csv"), row.names = FALSE)
+  
+  # fold separation: distance from each test point to nearest TRAINING point (projected metres)
+  sep <- do.call(rbind, lapply(1:5, function(i) {
+    te <- which(folds == i); tr <- if (!is.null(train_used[[i]])) train_used[[i]] else which(folds != i)
+    nn <- apply(Dm[te, tr, drop = FALSE], 1, min)
+    data.frame(Fold = i, n_test = length(te), NN_min_km = round(min(nn) / 1000, 2),
+               NN_p10_km = round(quantile(nn, 0.10) / 1000, 2), NN_median_km = round(median(nn) / 1000, 2),
+               Prop_test_with_training_point_within_block = round(mean(nn < actual_size), 3))
+  }))
+  cat("\n  === FOLD SEPARATION (nearest training point to each test point) ===\n"); print(sep, row.names = FALSE)
+  write.csv(sep, paste0(dir, "CV_fold_separation.csv"), row.names = FALSE)
+  rm(Dm)
+  write.csv(data.frame(dat[, c("x","y","presence","src")], folds = folds, oof),
+            paste0(dir, "OOF_predictions.csv"), row.names = FALSE)
+  
+  # ---- ensemble weights + OOF ensemble + ensemble threshold (R13) ----
+  w_full <- setNames(rep(0, 5), MODEL_NAMES)
+  if (nrow(results) > 0) {
+    wm <- tapply(results$AUC, results$Model, mean, na.rm = TRUE)
+    w_full[names(wm)] <- wm
+  }
+  if (sum(w_full) == 0) w_full[] <- 1
+  cat("\n  Ensemble weights (AUC-based):\n"); print(round(w_full / sum(w_full), 4))
+  write.csv(data.frame(Model = MODEL_NAMES, AUC_mean = as.numeric(w_full),
+                       Weight = round(as.numeric(w_full / sum(w_full)), 4)),
+            paste0(dir, "Ensemble_weights.csv"), row.names = FALSE)
+  
+  # OOF ensemble with leave-one-fold-out weights (fold i's own AUC never sets its weights)
+  write.csv(do.call(rbind, lapply(1:5, function(i) data.frame(
+    Predicted_fold = i, Model = MODEL_NAMES,
+    Weight = round(as.numeric(lofo_weights(results, i) / sum(lofo_weights(results, i))), 4)))),
+    paste0(dir, "Ensemble_weights_LOFO_per_fold.csv"), row.names = FALSE)
+  ens_oof <- oof_ensemble_lofo(oof, folds, results)
+  ev_all  <- ens_eval(dat$presence, ens_oof)
+  ev_fld  <- ens_eval(dat$presence[is_field], ens_oof[is_field])
+  cat(sprintf("  Ensemble OOF: AUC=%.3f | max-TSS threshold=%.3f (TSS_opt=%.3f, optimistic) | field-only AUC=%.3f\n",
+              ev_all$auc, ev_all$thr, ev_all$tss, ev_fld$auc))
+  write.csv(data.frame(Set = c("All rows","Field presence vs field non-detection"),
+                       OOF_AUC_primary = c(ev_all$auc, ev_fld$auc),
+                       Operational_threshold_maxTSS = c(ev_all$thr, ev_fld$thr),
+                       TSS_at_optimised_threshold = c(ev_all$tss, ev_fld$tss),
+                       Note = "TSS is computed at a threshold optimised on the same OOF predictions; not independent. Report AUC as primary metric."),
+            paste0(dir, "Ensemble_OOF_performance.csv"), row.names = FALSE)
+  fo <- do.call(rbind, lapply(c(MODEL_NAMES, "Ensemble"), function(m) {
+    pr <- if (m == "Ensemble") ens_oof else oof[, m]
+    f <- function(idx) {
+      ok <- idx & !is.na(pr)
+      if (sum(ok) < 10 || length(unique(dat$presence[ok])) < 2) return(c(NA, NA, NA, sum(ok), NA))
+      r <- pROC::roc(dat$presence[ok], pr[ok], levels = c(0, 1), direction = "<", quiet = TRUE)
+      ci <- as.numeric(pROC::ci.auc(r)); c(ci[2], ci[1], ci[3], sum(ok), sum(dat$presence[ok] == 1))
+    }
+    a <- f(rep(TRUE, n)); b <- f(is_field)
+    data.frame(Model = m, AUC_all = round(a[1], 3), AUC_all_lo = round(a[2], 3), AUC_all_hi = round(a[3], 3),
+               AUC_field_only = round(b[1], 3), AUC_field_lo = round(b[2], 3), AUC_field_hi = round(b[3], 3),
+               n_field = b[4], n_field_presences = b[5])
+  }))
+  cat("\n  === OOF AUC: all records vs FIELD-ONLY (presence vs field non-detection), 95% DeLong CI ===\n")
+  print(fo, row.names = FALSE)
+  write.csv(fo, paste0(dir, "OOF_AUC_all_vs_field_only.csv"), row.names = FALSE)
+  
+  # ---- final models (full-data VIF + scaling) ----
+  cat("\n  Final models...\n")
+  pf_full <- prep_fold(dat, dat)
+  cat("  Final VIF-retained:", paste(pf_full$vars, collapse = ", "), "\n")
+  write.csv(rbind(data.frame(Variable = pf_full$vars, Status = "Retained"),
+                  data.frame(Variable = setdiff(ALL_VARS, pf_full$vars), Status = "Excluded (VIF>5)")),
+            paste0(dir, "VIF_selection_table.csv"), row.names = FALSE)
+  write.csv(pf_full$vif@results, paste0(dir, "VIF_results.csv"), row.names = FALSE)
+  write.csv(data.frame(Variable = pf_full$vars, Mean = pf_full$mu, SD = pf_full$sd),
+            paste0(dir, "Predictor_scaler.csv"), row.names = FALSE)
+  fm_final <- fit_models(pf_full$train_sc, dat, pf_full$vars, paste0(dir, "maxent_final/"), full = TRUE)
+  
+  # ---- maps ----
+  cat("  Maps (relative suitability index)...\n")
+  env_sc <- env[[pf_full$vars]]
+  for (v in pf_full$vars)
+    env_sc[[v]] <- (env_sc[[v]] - unname(pf_full$mu[v])) / unname(pf_full$sd[v])
+  
+  maps <- list()
+  add_map <- function(nm, expr) {
+    r <- tryCatch(expr, error = function(e) { cat("   Map", nm, "failed:", e$message, "\n"); NULL })
+    if (!is.null(r)) {
+      names(r) <- nm; r <- mask(r, vect(wg))
+      writeRaster(r, paste0(dir, "Map_", nm, ".tif"), overwrite = TRUE)
+      maps[[nm]] <<- r
+    }
+  }
+  if (!is.null(fm_final$glm))  add_map("GLM",  predict(env_sc, fm_final$glm, type = "response"))
+  if (!is.null(fm_final$rf))   add_map("RF",   predict(env_sc, fm_final$rf, type = "prob")[[2]])
+  if (!is.null(fm_final$brt))  add_map("BRT",  predict(env_sc, fm_final$brt, n.trees = fm_final$brt_n, type = "response"))
+  if (!is.null(fm_final$mars)) add_map("MARS", predict(env_sc, fm_final$mars, type = "response"))
+  if (!is.null(fm_final$mx)) add_map("MaxEnt", {
+    r <- tryCatch(rast(raster::predict(raster::stack(env[[pf_full$vars]]), fm_final$mx)),
+                  error = function(e) NULL)
+    if (is.null(r)) {   # data.frame fallback
+      vdf <- as.data.frame(env[[pf_full$vars]], na.rm = FALSE)
+      cc  <- complete.cases(vdf); pv <- rep(NA_real_, nrow(vdf))
+      pv[cc] <- as.numeric(predict(fm_final$mx, vdf[cc, , drop = FALSE]))
+      r <- setValues(env[[1]], pv)
+    }
+    r
+  })
+  if (length(maps) < 2) stop("Fewer than 2 model maps produced")
+  ens <- make_ensemble(maps, w_full)
+  ens_wt <- mask(ens$wt, vect(wg)); ens_sd <- mask(ens$sd, vect(wg)); ens_mn <- mask(ens$mean, vect(wg))
+  writeRaster(ens_mn, paste0(dir, "Map_Ensemble_mean.tif"),     overwrite = TRUE)
+  writeRaster(ens_wt, paste0(dir, "Map_Ensemble_weighted.tif"), overwrite = TRUE)
+  writeRaster(ens_sd, paste0(dir, "Map_InterModel_Disagreement_SD.tif"), overwrite = TRUE)
+  
+  list(tag = tag, dir = dir, dat = dat, folds = folds, block_size = actual_size,
+       results = results, roc = roc_all, oof = oof, w_full = w_full, ens_oof = ens_oof,
+       ens_perf = ev_all, ens_perf_field = ev_fld, ens_thr = ev_all$thr,
+       pf = pf_full, fm = fm_final, maps = maps, ens_wt = ens_wt, ens_sd = ens_sd,
+       is_field = is_field)
+}
+
+
+# ============================================================================
+# 15. RUN SCENARIOS
+# ============================================================================
+
+cat("\n[7/9] Primary scenario (inverse-KDE background)...\n")
+sc_main <- run_scenario(data_all, "KDE_inverse", out, plot_cv = TRUE)
+
+cat("\n[8/9] Sensitivity scenario (random background)...\n")
+sc_rand <- run_scenario(data_all_rand, "Random", out_rand)
+
+vars     <- sc_main$pf$vars
+results  <- sc_main$results
+dewpoint_status <- if ("Dewpoint" %in% vars) "RETAINED" else "REMOVED by VIF"
+cat("\n  Dewpoint status (final model):", dewpoint_status, "\n")
+write.csv(data.frame(Variable = "Dewpoint", Status = dewpoint_status),
+          paste0(out, "Dewpoint_VIF_status.csv"), row.names = FALSE)
+
+# Shared cell areas (geodetic) — all scenarios share the same masked grid
+cell_areas     <- cellSize(sc_main$ens_wt, unit = "km", mask = TRUE)
+total_area_km2 <- global(cell_areas, "sum", na.rm = TRUE)[[1]]
+area_km2 <- function(cond) {   # returns 0 (not NaN) when no cell satisfies the condition
+  v <- global(ifel(cond, cell_areas, 0), "sum", na.rm = TRUE)[[1]]
+  if (!is.finite(v)) 0 else round(v, 0)
+}
+cat("  Total study area:", round(total_area_km2, 0), "km2\n")
+
+
+# ============================================================================
+# 16. CV QUALITY (primary scenario)
+# ============================================================================
+
+cat("\n=== CV Quality Assessment ===\n")
+if (nrow(results) > 0) {
+  cv_stability <- results %>% dplyr::group_by(Model) %>%
+    dplyr::summarise(AUC_mean = round(mean(AUC), 4), AUC_SD = round(sd(AUC), 4),
+                     AUC_CV = round(100 * sd(AUC) / mean(AUC), 2),
+                     TSS_opt_mean = round(mean(TSS_opt), 4), TSS_opt_SD = round(sd(TSS_opt), 4),
+                     .groups = "drop") %>% dplyr::arrange(AUC_CV)
+  print(cv_stability)
+  write.csv(cv_stability, paste0(out, "CV_stability_metrics.csv"), row.names = FALSE)
+  
+  p_auc_box <- ggplot(results, aes(x = reorder(Model, AUC, median), y = AUC, fill = Model)) +
+    geom_boxplot(alpha = 0.7, width = 0.5, outlier.shape = NA) +
+    geom_jitter(width = 0.08, size = 3, alpha = 0.85) +
+    geom_hline(yintercept = 0.7, linetype = "dashed", colour = "red") +
+    geom_hline(yintercept = 0.9, linetype = "dashed", colour = "darkgreen") +
+    scale_fill_brewer(palette = "Dark2") +
+    scale_y_continuous(limits = c(0, 1.02), breaks = seq(0, 1, 0.1)) +
+    labs(title = paste0("AUC across 5 Spatial CV Folds — H. ", SPECIES),
+         subtitle = "Mean \u00b1 SD across folds | preprocessing done within folds | Y-axis from 0",
+         x = NULL, y = "AUC") +
+    theme_bw(base_size = 14) + theme(legend.position = "none", plot.title = element_text(face = "bold"))
+  save_gg(p_auc_box, paste0(out, "CV_AUC_boxplot.png"), 7, 5)
+  
+  # EXPLORATORY only: n = 5 folds, exact paired Wilcoxon (min two-sided p = 0.0625), Holm-adjusted
+  pair_df <- dplyr::bind_rows(lapply(combn(unique(results$Model), 2, simplify = FALSE), function(p) {
+    a <- results$AUC[results$Model == p[1]]; b <- results$AUC[results$Model == p[2]]
+    if (length(a) < 3 || length(a) != length(b)) return(NULL)
+    wt <- tryCatch(suppressWarnings(wilcox.test(a, b, paired = TRUE, exact = TRUE)), error = function(e) NULL)
+    if (is.null(wt)) return(NULL)
+    data.frame(Model_A = p[1], Model_B = p[2], AUC_A = round(mean(a), 4), AUC_B = round(mean(b), 4),
+               p_value = round(wt$p.value, 4))
+  }))
+  if (nrow(pair_df) > 0) {
+    pair_df$p_holm <- round(p.adjust(pair_df$p_value, method = "holm"), 4)
+    pair_df$Note <- "Exploratory; 5 folds give very low power. Prefer descriptive fold-level AUC (mean +/- SD)."
+    write.csv(pair_df, paste0(out, "CV_pairwise_EXPLORATORY.csv"), row.names = FALSE)
+  }
+  
+  summary_tbl <- results %>% dplyr::group_by(Model) %>%
+    dplyr::summarise(AUC_mean = round(mean(AUC), 3), AUC_SD = round(sd(AUC), 3),
+                     TSS_opt_mean = round(mean(TSS_opt), 3), TSS_opt_SD = round(sd(TSS_opt), 3),
+                     Sensitivity_mean = round(mean(Sensitivity), 3),
+                     Specificity_mean = round(mean(Specificity), 3),
+                     OmissionRate_mean = round(mean(OmissionRate), 3),
+                     Kappa_mean = round(mean(Kappa), 3),
+                     Threshold_mean = round(mean(Threshold, na.rm = TRUE), 3),
+                     .groups = "drop") %>% dplyr::arrange(desc(AUC_mean))
+  write.csv(summary_tbl, paste0(out, "Model_summary_table.csv"), row.names = FALSE)
+  print(summary_tbl)
+}
+
+# ROC curves
+if (nrow(sc_main$roc) > 0) {
+  roc_sum <- sc_main$roc %>% dplyr::group_by(Model, Specificity) %>%
+    dplyr::summarise(Se_mean = mean(Sensitivity), Se_low = mean(Se_lower),
+                     Se_high = mean(Se_upper), .groups = "drop")
+  p_roc <- ggplot(roc_sum, aes(1 - Specificity, Se_mean, colour = Model, fill = Model)) +
+    geom_ribbon(aes(ymin = Se_low, ymax = Se_high), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 1.2) + geom_abline(linetype = "dashed", colour = "grey50") +
+    scale_colour_brewer(palette = "Dark2") + scale_fill_brewer(palette = "Dark2") +
+    labs(title = paste0("ROC Curves — H. ", SPECIES, " (5-fold spatial block CV)"),
+         subtitle = "Shaded band = mean 95% CI across folds",
+         x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)") +
+    theme_bw(base_size = 14) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+  save_gg(p_roc, paste0(out, "ROC_curves_CI.png"), 8, 5)
+}
+
+
+# ============================================================================
+# 17. OOF CALIBRATION (R6)
+# ============================================================================
+
+CAL_MIN_N <- 10   # bins with fewer observations are drawn hollow = unreliable
+
+wilson_ci <- function(k, n, z = 1.96) {
+  p <- k / n; den <- 1 + z^2 / n
+  cen <- (p + z^2 / (2 * n)) / den; half <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / den
+  cbind(lo = pmax(0, cen - half), hi = pmin(1, cen + half))
+}
+cal_bins <- function(obs, pred, model, breaks = seq(0, 1, 0.1)) {
+  ok <- !is.na(pred) & !is.na(obs)
+  if (sum(ok) < 20) return(NULL)
+  d <- data.frame(obs = obs[ok], pred = pred[ok])
+  d$bin <- cut(d$pred, breaks, include.lowest = TRUE)
+  b <- d %>% dplyr::group_by(bin) %>%
+    dplyr::summarise(mean_pred = mean(pred), n = dplyr::n(), n_pres = sum(obs == 1), .groups = "drop")
+  b$obs_prop <- b$n_pres / b$n
+  ci <- wilson_ci(b$n_pres, b$n); b$lo <- ci[, "lo"]; b$hi <- ci[, "hi"]
+  b$reliable <- b$n >= CAL_MIN_N
+  b$bin <- as.character(b$bin); b$Model <- model; b$prevalence_design <- mean(d$obs == 1)
+  as.data.frame(b)
+}
+
+# Interpretation: x = relative suitability index (NOT a calibrated probability); y = share of presence records
+# among the records in the bin, which depends on the presence:zero ratio of the design. A 1:1 line is therefore
+# NOT drawn; the dotted line is the overall presence share (what a model with no discrimination would give).
+calibration_plot <- function(obs, pred, name) {
+  b <- cal_bins(obs, pred, name)
+  if (is.null(b) || nrow(b) < 2) { cat("  Skip calibration [", name, "]\n"); return(invisible(NULL)) }
+  p <- ggplot(b, aes(mean_pred, obs_prop)) +
+    geom_hline(yintercept = b$prevalence_design[1], linetype = "dotted", colour = "grey40") +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.015, colour = "steelblue", alpha = 0.8) +
+    geom_point(aes(size = n, shape = factor(reliable, levels = c(TRUE, FALSE))), colour = "steelblue") +
+    scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1), labels = c(paste0("n >= ", CAL_MIN_N), paste0("n < ", CAL_MIN_N)),
+                       name = "Observations in bin", drop = FALSE) +
+    scale_size_continuous(range = c(1.5, 6), name = "n in bin") +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+    labs(title = paste("Out-of-fold calibration —", name, "|", SPECIES),
+         subtitle = "Bars = 95% Wilson intervals; dotted = overall presence share of the modelling data (no-skill reference).\nIndex is a relative suitability index, not a probability; do not rank algorithms from this plot.",
+         x = "Mean out-of-fold relative suitability index (bin)", y = "Observed share of presence records in bin") +
+    theme_bw(base_size = 12) + theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(size = 8))
+  save_gg(p, paste0(out, "Calibration_OOF_", name, ".png"), 6.5, 5.5)
+  invisible(b)
+}
+cal_all <- lapply(MODEL_NAMES, function(m) calibration_plot(sc_main$dat$presence, sc_main$oof[, m], m))
+cal_all <- c(cal_all, list(calibration_plot(sc_main$dat$presence, sc_main$ens_oof, "Ensemble")))
+cal_tbl <- dplyr::bind_rows(cal_all)
+if (nrow(cal_tbl) > 0) {
+  write.csv(cal_tbl, paste0(out, "Calibration_OOF_data.csv"), row.names = FALSE)
+  cat("  Calibration bins with n <", CAL_MIN_N, ":", sum(!cal_tbl$reliable), "of", nrow(cal_tbl), "(flagged hollow)\n")
+}
+
+
+# ============================================================================
+# 18. RESPONSE CURVES (final models, scaled predictors; MaxEnt in raw units)
+# ============================================================================
+
+cat("\n  Response curves...\n")
+data_final <- sc_main$pf$train_sc
+fm <- sc_main$fm
+
+rc_bootstrap <- function(final_mod, predict_fn, data, var_list, n_boot = 50, n_pts = 100) {
+  rc_all <- data.frame()
+  for (vname in var_list) {
+    vr <- range(data[[vname]], na.rm = TRUE); if (diff(vr) == 0) next
+    var_seq <- seq(vr[1], vr[2], length.out = n_pts)
+    base_row <- data[1, , drop = FALSE]
+    for (v in names(data)) if (is.numeric(data[[v]])) base_row[[v]] <- median(data[[v]], na.rm = TRUE)
+    boot_mat <- matrix(NA_real_, n_pts, n_boot)
+    for (b in seq_len(n_boot)) {
+      idx <- sample(nrow(data), replace = TRUE)
+      bm  <- tryCatch(update(final_mod, data = data[idx, ]), error = function(e) NULL)
+      if (is.null(bm)) next
+      for (j in seq_along(var_seq)) {
+        tmp <- base_row; tmp[[vname]] <- var_seq[j]
+        boot_mat[j, b] <- tryCatch(predict_fn(bm, tmp), error = function(e) NA_real_)
+      }
+    }
+    rc_all <- rbind(rc_all, data.frame(Variable = vname, x = var_seq,
+                                       mean = rowMeans(boot_mat, na.rm = TRUE),
+                                       lower = apply(boot_mat, 1, quantile, 0.025, na.rm = TRUE),
+                                       upper = apply(boot_mat, 1, quantile, 0.975, na.rm = TRUE)))
+  }
+  rc_all
+}
+
+plot_rc_boot <- function(rc_df, title_str, fname, col = "steelblue") {
+  if (nrow(rc_df) == 0) return(invisible())
+  write.csv(rc_df, paste0(out, sub("\\.png$", "_data.csv", fname)), row.names = FALSE)   # for figure script
+  nr <- ceiling(length(unique(rc_df$Variable)) / 3)
+  p <- ggplot(rc_df, aes(x, mean)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = col, alpha = 0.2) +
+    geom_line(colour = col, linewidth = 1.1) +
+    facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+    labs(title = title_str, subtitle = "Shaded = 95% bootstrap CI (n=50 resamples)",
+         x = "Predictor value (standardised)", y = "Relative suitability index") +
+    theme_bw(base_size = 13) + theme(strip.text = element_text(face = "bold"), plot.title = element_text(face = "bold"))
+  save_gg(p, paste0(out, fname), 10, 2.8 * nr)
+}
+
+manual_pdp <- function(model, predict_fn, data_pred, var_list, n_pts = 100, model_name, col) {
+  data_pred <- as.data.frame(data_pred); pd <- list()
+  for (v in var_list) {
+    vr <- range(data_pred[[v]], na.rm = TRUE); if (diff(vr) == 0) next
+    g <- seq(vr[1], vr[2], length.out = n_pts)
+    yhat <- sapply(g, function(val) { tmp <- data_pred; tmp[[v]] <- val
+    mean(tryCatch(predict_fn(model, tmp), error = function(e) NA_real_), na.rm = TRUE) })
+    pd[[v]] <- data.frame(Variable = v, x = g, yhat = yhat)
+  }
+  if (length(pd) == 0) return(invisible())
+  pd_all <- dplyr::bind_rows(pd); nr <- ceiling(length(pd) / 3)
+  write.csv(data.frame(Variable = pd_all$Variable, x = pd_all$x, mean = pd_all$yhat, lower = NA_real_, upper = NA_real_),
+            paste0(out, "Response_curves_", model_name, "_data.csv"), row.names = FALSE)   # for figure script
+  p <- ggplot(pd_all, aes(x, yhat)) + geom_line(colour = col, linewidth = 1.1) +
+    geom_rug(sides = "b", colour = "grey60", alpha = 0.3, linewidth = 0.3) +
+    facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+    labs(title = paste(model_name, "— Partial Dependence Plots"),
+         subtitle = paste0("Marginal effect across ", nrow(data_pred), " training rows"),
+         x = "Predictor value (standardised)", y = "Relative suitability index") +
+    theme_bw(base_size = 13) + theme(strip.text = element_text(face = "bold"), plot.title = element_text(face = "bold"))
+  save_gg(p, paste0(out, "Response_curves_", model_name, ".png"), 10, 2.8 * nr)
+}
+
+if (!is.null(fm$glm))
+  plot_rc_boot(rc_bootstrap(fm$glm, function(m, nd) as.numeric(predict(m, nd, type = "response")),
+                            data_final, vars), "GLM — Response Curves (95% CI)",
+               "Response_curves_GLM.png", "#1b7837")
+if (!is.null(fm$mars))
+  plot_rc_boot(rc_bootstrap(fm$mars, function(m, nd) as.numeric(predict(m, nd, type = "response")),
+                            data_final, vars), "MARS — Response Curves (95% CI)",
+               "Response_curves_MARS.png", "#762a83")
+if (!is.null(fm$rf))
+  manual_pdp(fm$rf, function(m, nd) predict(m, as.data.frame(nd), type = "prob")[, "1"],
+             data_final[, vars], vars, model_name = "RF", col = "steelblue")
+if (!is.null(fm$brt))
+  manual_pdp(fm$brt, function(m, nd) predict(m, as.data.frame(nd), n.trees = fm$brt_n, type = "response"),
+             data_final[, vars], vars, model_name = "BRT", col = "#e6550d")
+if (!is.null(fm$mx)) tryCatch({
+  rc <- NULL; rc_src <- NA_character_
+  # (1) MaxEnt's own response-curve data files, if the jar wrote them
+  pdir_mx <- file.path(paste0(out, "maxent_final/"), "plots")
+  fl <- if (dir.exists(pdir_mx)) list.files(pdir_mx, pattern = "\\.dat$", full.names = TRUE, ignore.case = TRUE) else character(0)
+  cat("  MaxEnt plots dir:", pdir_mx, "| .dat files found:", length(fl), "\n")
+  if (length(fl) > 0) {
+    vars_long_first <- vars[order(-nchar(vars))]
+    rc <- dplyr::bind_rows(lapply(fl, function(f) {
+      d <- tryCatch(read.csv(f, header = TRUE), error = function(e) NULL)
+      if (is.null(d) || ncol(d) < 2) return(NULL)
+      nm <- tools::file_path_sans_ext(basename(f))
+      mv <- vars_long_first[sapply(vars_long_first, function(v) grepl(paste0("_", v, "$"), nm))][1]
+      if (is.na(mv)) NULL else data.frame(Variable = mv, x = d[, 1], y = d[, 2]) }))
+    if (!is.null(rc) && nrow(rc) > 0) rc_src <- "MaxEnt .dat response-curve files"
+  }
+  # (2) fallback: marginal response computed directly from the fitted model (other predictors at their mean)
+  if (is.null(rc) || nrow(rc) == 0) {
+    cat("  No usable .dat files -> computing MaxEnt response curves from the fitted model (others at mean)\n")
+    raw  <- sc_main$dat
+    base <- as.data.frame(lapply(raw[, vars, drop = FALSE], mean, na.rm = TRUE))
+    rc <- dplyr::bind_rows(lapply(vars, function(v) {
+      r <- range(raw[[v]], na.rm = TRUE); if (diff(r) == 0) return(NULL)
+      g <- seq(r[1], r[2], length.out = 100)
+      nd <- base[rep(1, length(g)), , drop = FALSE]; nd[[v]] <- g
+      data.frame(Variable = v, x = g, y = as.numeric(predict(fm$mx, nd))) }))
+    rc_src <- "computed from fitted MaxEnt model (other predictors at mean)"
+  }
+  if (!is.null(rc) && nrow(rc) > 0) {
+    rc$Source <- rc_src
+    write.csv(rc, paste0(out, "Response_curves_MaxEnt_data.csv"), row.names = FALSE)   # for figure script
+    p <- ggplot(rc, aes(x, y)) + geom_line(colour = "#d95f02", linewidth = 1.2) +
+      facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+      labs(title = "MaxEnt — Response Curves", subtitle = paste0("Logistic output | raw predictor units | ", rc_src),
+           x = "Predictor value (original units)", y = "Relative suitability index") +
+      theme_bw(base_size = 13)
+    save_gg(p, paste0(out, "Response_curves_MaxEnt.png"), 10, 2.8 * ceiling(length(unique(rc$Variable)) / 3))
+  } else cat("  MaxEnt response curves could not be produced by either route\n")
+}, error = function(e) cat("  MaxEnt response curves skipped:", e$message, "\n"))
+
+
+# ============================================================================
+# 19. VARIABLE IMPORTANCE (algorithm-specific, normalised within model)
+# ============================================================================
+
+get_importance <- function(fm, vars) {
+  L <- list()
+  if (!is.null(fm$glm)) {
+    cf <- abs(coef(fm$glm)[-1]); cf <- cf[!is.na(cf)]
+    L$GLM <- data.frame(Model = "GLM", Variable = names(cf), Raw = as.numeric(cf))
+  }
+  if (!is.null(fm$rf)) {
+    ri <- importance(fm$rf)
+    col <- intersect(c("MeanDecreaseAccuracy", "MeanDecreaseGini"), colnames(ri))[1]
+    L$RF <- data.frame(Model = "RF", Variable = rownames(ri), Raw = as.numeric(ri[, col]))
+  }
+  if (!is.null(fm$brt)) {
+    s <- summary(fm$brt, n.trees = fm$brt_n, plotit = FALSE)
+    L$BRT <- data.frame(Model = "BRT", Variable = as.character(s$var), Raw = s$rel.inf)
+  }
+  if (!is.null(fm$mars)) tryCatch({
+    ev <- unclass(evimp(fm$mars))
+    L$MARS <- data.frame(Model = "MARS", Variable = gsub("-unused$", "", rownames(ev)),
+                         Raw = as.numeric(ev[, "nsubsets"]))
+  }, error = function(e) NULL)
+  if (!is.null(fm$mx)) tryCatch({
+    rs <- fm$mx@results; rn <- grep("permutation.importance", rownames(rs), value = TRUE)
+    L$MaxEnt <- data.frame(Model = "MaxEnt",
+                           Variable = sub("\\.permutation\\.importance$", "", rn),
+                           Raw = as.numeric(rs[rn, 1]))
+  }, error = function(e) NULL)
+  dplyr::bind_rows(L) %>% dplyr::filter(Variable %in% vars, !is.na(Raw)) %>%
+    dplyr::group_by(Model) %>% dplyr::mutate(RelImp = 100 * Raw / max(Raw, na.rm = TRUE)) %>%
+    dplyr::arrange(Model, desc(RelImp)) %>% dplyr::mutate(Rank = dplyr::row_number()) %>%
+    dplyr::ungroup()
+}
+
+imp_main <- get_importance(sc_main$fm, vars)
+imp_rand <- get_importance(sc_rand$fm, sc_rand$pf$vars)
+write.csv(imp_main, paste0(out, "VarImportance_all_models_long.csv"), row.names = FALSE)
+
+top_pred <- imp_main %>% dplyr::filter(Rank == 1) %>% dplyr::select(Model, Top_predictor = Variable, RelImp)
+solar_rank <- imp_main %>% dplyr::filter(Variable == "Solar_radiation") %>% dplyr::select(Model, Rank, RelImp)
+cat("\n  === TOP PREDICTOR PER MODEL ===\n"); print(as.data.frame(top_pred))
+cat("\n  === SOLAR RADIATION RANK PER MODEL ===\n"); print(as.data.frame(solar_rank))
+write.csv(top_pred,   paste0(out, "Top_predictor_per_model.csv"), row.names = FALSE)
+write.csv(solar_rank, paste0(out, "Solar_radiation_rank_per_model.csv"), row.names = FALSE)
+
+consensus_tbl <- imp_main %>% dplyr::group_by(Variable) %>%
+  dplyr::summarise(N_models_top3 = sum(Rank <= 3), Mean_RelImp = round(mean(RelImp), 1),
+                   Models_top3 = paste(Model[Rank <= 3], collapse = ", "), .groups = "drop") %>%
+  dplyr::arrange(desc(N_models_top3), desc(Mean_RelImp))
+write.csv(consensus_tbl, paste0(out, "VarImportance_consensus.csv"), row.names = FALSE)
+
+var_order <- imp_main %>% dplyr::group_by(Variable) %>%
+  dplyr::summarise(m = mean(RelImp), .groups = "drop") %>% dplyr::arrange(m) %>% dplyr::pull(Variable)
+imp_plot <- imp_main; imp_plot$Variable <- factor(imp_plot$Variable, levels = var_order)
+imp_plot$Model <- factor(imp_plot$Model, levels = MODEL_NAMES)
+p1 <- ggplot(imp_plot, aes(RelImp, Variable, fill = Model)) +
+  geom_col(position = position_dodge(0.7), width = 0.65) +
+  scale_fill_manual(values = c(GLM="#7570b3", RF="#1b9e77", BRT="#d95f02", MARS="#e7298a", MaxEnt="#66a61e")) +
+  labs(title = paste0("A. Variable importance — H. ", SPECIES),
+       subtitle = "Normalised within each algorithm (100 = top predictor of that algorithm): compare RANKS, not magnitudes",
+       x = "Relative importance (%)", y = NULL) +
+  theme_bw(base_size = 14) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+                                   panel.grid.major.y = element_blank())
+cons_pub <- imp_main %>% dplyr::filter(Rank <= 3) %>% dplyr::count(Variable, name = "Count")
+cons_pub$Variable <- factor(cons_pub$Variable, levels = var_order)
+p2 <- ggplot(cons_pub, aes(Count, Variable)) + geom_col(fill = "#2c7fb8", width = 0.65) +
+  labs(title = "B. Number of algorithms ranking the predictor in the top 3", x = "Number of models", y = NULL) +
+  scale_x_continuous(breaks = 0:5) + theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.major.y = element_blank())
+save_gg(p1 / p2, paste0(out, "Figure_VariableImportance_", SPECIES, ".png"), 10, 12)
+
+
+# ============================================================================
+# 20. BACKGROUND SENSITIVITY: KDE vs RANDOM (R3)
+# ============================================================================
+
+cat("\n=== Background sensitivity: KDE vs Random ===\n")
+
+scenario_metrics <- function(sc, imp) {
+  ens <- sc$ens_wt; sdr <- sc$ens_sd; thr <- sc$ens_thr
+  mean_auc <- if (nrow(sc$results) > 0) tapply(sc$results$AUC, sc$results$Model, mean) else NULL
+  mean_tss <- if (nrow(sc$results) > 0) tapply(sc$results$TSS_opt, sc$results$Model, mean) else NULL
+  m <- c(setNames(round(mean_auc, 3), paste0("AUC_", names(mean_auc))),
+         setNames(round(mean_tss, 3), paste0("TSS_opt_", names(mean_tss))),
+         Ensemble_OOF_AUC = round(sc$ens_perf$auc, 3),
+         Ensemble_TSS_at_optimised_threshold = round(sc$ens_perf$tss, 3),
+         Ensemble_OOF_AUC_field_only = round(sc$ens_perf_field$auc, 3),
+         Ensemble_threshold = round(thr, 3),
+         Suitable_area_km2 = area_km2(ens >= thr),
+         High_suitability_area_km2 = area_km2(ens >= HIGH_SUIT),
+         Priority_area_km2 = area_km2(ens >= HIGH_SUIT & sdr < SD_PRIMARY))
+  tp <- imp %>% dplyr::filter(Rank == 1)
+  c(as.list(m), Top_predictors = paste(paste0(tp$Model, ":", tp$Variable), collapse = "; "))
+}
+sm_kde  <- scenario_metrics(sc_main, imp_main)
+sm_rand <- scenario_metrics(sc_rand, imp_rand)
+all_names <- union(names(sm_kde), names(sm_rand))
+r_maps <- {
+  v <- values(c(sc_main$ens_wt, sc_rand$ens_wt), na.rm = TRUE); round(cor(v[,1], v[,2]), 4) }
+sens_tbl <- data.frame(
+  Metric = c(all_names, "Map_correlation_KDE_vs_Random"),
+  KDE_inverse = c(sapply(all_names, function(n) as.character(sm_kde[[n]] %||% NA)), as.character(r_maps)),
+  Random      = c(sapply(all_names, function(n) as.character(sm_rand[[n]] %||% NA)), as.character(r_maps)))
+print(sens_tbl, row.names = FALSE)
+write.csv(sens_tbl, paste0(out, "Background_sensitivity_comparison.csv"), row.names = FALSE)
+
+# Spatial agreement of zones between KDE and random-background scenarios
+cmp_zone <- function(a, b, label) {
+  both <- area_km2(a & b); a_only <- area_km2(a & !b); b_only <- area_km2(!a & b)
+  data.frame(Zone = label, KDE_only_km2 = a_only, Random_only_km2 = b_only, Both_km2 = both,
+             Jaccard = ifelse(both + a_only + b_only > 0, round(both / (both + a_only + b_only), 3), NA),
+             Sorensen = ifelse(2 * both + a_only + b_only > 0, round(2 * both / (2 * both + a_only + b_only), 3), NA))
+}
+zone_cmp <- rbind(
+  cmp_zone(sc_main$ens_wt >= sc_main$ens_thr, sc_rand$ens_wt >= sc_rand$ens_thr, "Suitable (own OOF threshold)"),
+  cmp_zone(sc_main$ens_wt >= HIGH_SUIT, sc_rand$ens_wt >= HIGH_SUIT, paste0("High suitability (>=", HIGH_SUIT, ")")),
+  cmp_zone(sc_main$ens_wt >= HIGH_SUIT & sc_main$ens_sd < SD_PRIMARY,
+           sc_rand$ens_wt >= HIGH_SUIT & sc_rand$ens_sd < SD_PRIMARY,
+           paste0("Priority (>=", HIGH_SUIT, " & SD<", SD_PRIMARY, ")")))
+cat("\n  === SPATIAL AGREEMENT: KDE vs RANDOM BACKGROUND ===\n"); print(zone_cmp, row.names = FALSE)
+write.csv(zone_cmp, paste0(out, "Background_sensitivity_zone_agreement.csv"), row.names = FALSE)
+
+# top-3 consensus, both strategies
+cons_cmp <- dplyr::full_join(
+  imp_main %>% dplyr::filter(Rank <= 3) %>% dplyr::count(Variable, name = "Count_KDE"),
+  imp_rand %>% dplyr::filter(Rank <= 3) %>% dplyr::count(Variable, name = "Count_Random"), by = "Variable") %>%
+  dplyr::mutate(Count_KDE = tidyr::replace_na(Count_KDE, 0), Count_Random = tidyr::replace_na(Count_Random, 0),
+                Both_strategies = Count_KDE > 0 & Count_Random > 0) %>% dplyr::arrange(desc(Count_KDE))
+write.csv(cons_cmp, paste0(out, "Background_sensitivity_consensus.csv"), row.names = FALSE)
+plot_data <- rbind(
+  data.frame(Variable = cons_cmp$Variable, Strategy = "Inverse KDE", Count = cons_cmp$Count_KDE),
+  data.frame(Variable = cons_cmp$Variable, Strategy = "Random", Count = cons_cmp$Count_Random))
+p_sens <- ggplot(plot_data, aes(Count, reorder(Variable, Count), fill = Strategy)) +
+  geom_col(position = position_dodge(0.7), width = 0.6) +
+  scale_fill_manual(values = c("Inverse KDE" = "#1b7837", "Random" = "#d95f02")) +
+  labs(title = paste0("Background Sensitivity — H. ", SPECIES),
+       subtitle = "Number of algorithms ranking predictor in top 3", x = "No. models", y = NULL) +
+  scale_x_continuous(breaks = 0:5) + theme_bw(base_size = 13) + theme(legend.position = "bottom")
+save_gg(p_sens, paste0(out, "Background_sensitivity_figure.png"), 8, 5)
+
+
+# ============================================================================
+# 21. MARS SENSITIVITY (R12): area metrics as well as correlation
+# ============================================================================
+
+cat("\n=== MARS sensitivity ===\n")
+if ("MARS" %in% names(sc_main$maps)) {
+  ens_nm <- make_ensemble(sc_main$maps, sc_main$w_full, exclude = "MARS")
+  ens_nm_wt <- mask(ens_nm$wt, vect(wg)); ens_nm_sd <- mask(ens_nm$sd, vect(wg))
+  writeRaster(ens_nm_wt, paste0(out, "Map_Ensemble_noMARS.tif"), overwrite = TRUE)
+  ev_nm <- ens_eval(sc_main$dat$presence, oof_ensemble_lofo(sc_main$oof, sc_main$folds, sc_main$results, exclude = "MARS"))
+  v <- values(c(sc_main$ens_wt, ens_nm_wt), na.rm = TRUE)
+  mars_tbl <- data.frame(
+    Ensemble = c("Full (with MARS)", "Without MARS"),
+    OOF_AUC = round(c(sc_main$ens_perf$auc, ev_nm$auc), 3),
+    Threshold = round(c(sc_main$ens_thr, ev_nm$thr), 3),
+    Suitable_area_km2 = c(area_km2(sc_main$ens_wt >= sc_main$ens_thr), area_km2(ens_nm_wt >= ev_nm$thr)),
+    High_suit_area_km2 = c(area_km2(sc_main$ens_wt >= HIGH_SUIT), area_km2(ens_nm_wt >= HIGH_SUIT)),
+    Priority_area_km2 = c(area_km2(sc_main$ens_wt >= HIGH_SUIT & sc_main$ens_sd < SD_PRIMARY),
+                          area_km2(ens_nm_wt >= HIGH_SUIT & ens_nm_sd < SD_PRIMARY)),
+    Pearson_r_full_vs_noMARS = c(round(cor(v[,1], v[,2]), 4), NA))
+  print(mars_tbl, row.names = FALSE)
+  write.csv(mars_tbl, paste0(out, "MARS_sensitivity.csv"), row.names = FALSE)
+}
+
+
+# ============================================================================
+# 22. MORAN'S I ON OUT-OF-FOLD RESIDUALS (R7)
+# ============================================================================
+
+cat("\n[9/9] Moran's I on OOF residuals...\n")
+morans_test <- function(label, obs, pred, coords_df) {
+  ok <- !is.na(pred); if (sum(ok) < 30) return(NULL)
+  tryCatch({
+    resid <- obs[ok] - pred[ok]
+    nb  <- knn2nb(knearneigh(as.matrix(coords_df[ok, ]), k = 5))
+    mt  <- moran.test(resid, nb2listw(nb, style = "W"))
+    data.frame(Model = label, n = sum(ok),
+               Morans_I = round(unname(mt$estimate["Moran I statistic"]), 5),
+               Expected = round(unname(mt$estimate["Expectation"]), 5),
+               Variance = round(unname(mt$estimate["Variance"]), 8),
+               p_value = round(mt$p.value, 5),
+               Weights = "5-nearest-neighbour, row-standardised (projected coordinates)",
+               Interpretation = ifelse(mt$p.value < 0.05, "Significant spatial autocorrelation (p<0.05)",
+                                       "No significant spatial autocorrelation (p>=0.05)"))
+  }, error = function(e) { cat("  Moran [", label, "]:", e$message, "\n"); NULL })
+}
+cd <- sc_main$dat[, c("x","y")]
+if (is.lonlat(env)) {     # neighbour search on projected (metre) coordinates
+  pj <- crds(project(vect(cd, geom = c("x","y"), crs = crs(env)), UTM_CRS))
+  cd <- data.frame(x = pj[,1], y = pj[,2])
+  cat("  Moran's I neighbours computed in", UTM_CRS, "\n")
+}
+moran_res <- dplyr::bind_rows(c(
+  lapply(MODEL_NAMES, function(m) morans_test(m, sc_main$dat$presence, sc_main$oof[, m], cd)),
+  list(morans_test("Ensemble", sc_main$dat$presence, sc_main$ens_oof, cd))))
+if (nrow(moran_res) > 0) {
+  write.csv(moran_res, paste0(out, "Morans_I_OOF_residuals.csv"), row.names = FALSE)
+  print(moran_res[, c("Model","n","Morans_I","Expected","p_value","Interpretation")], row.names = FALSE)
+}
+ok <- !is.na(sc_main$ens_oof)
+resid_sf <- st_as_sf(data.frame(x = sc_main$dat$x[ok], y = sc_main$dat$y[ok],
+                                residual = sc_main$dat$presence[ok] - sc_main$ens_oof[ok]),
+                     coords = c("x","y"), crs = crs(env))
+p_resid <- ggplot() + geom_sf(data = wg, fill = "grey95", colour = "grey60") +
+  geom_sf(data = resid_sf, aes(colour = residual), size = 1.8) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "OOF residual") +
+  labs(title = paste0("Ensemble OOF residuals — H. ", SPECIES),
+       subtitle = "Blue = over-predicted | Red = under-predicted") + theme_bw(base_size = 13)
+save_gg(p_resid, paste0(out, "Ensemble_OOF_residual_map.png"), 7, 9)
+
+
+# ============================================================================
+# 23. AREA STATISTICS (cellSize, geodetic)
+# ============================================================================
+
+cat("\n=== Ensemble area statistics ===\n")
+ens <- sc_main$ens_wt
+area_stats <- data.frame(
+  Suitability_class = c("Low (<0.3)", "Moderate (0.3-0.5)", "High (0.5-0.7)", "Very high (>=0.7)"),
+  Area_km2 = c(area_km2(ens < 0.3), area_km2(ens >= 0.3 & ens < 0.5),
+               area_km2(ens >= 0.5 & ens < 0.7), area_km2(ens >= 0.7)))
+area_stats$Pct_WG   <- round(100 * area_stats$Area_km2 / total_area_km2, 2)
+area_stats$Species  <- SPECIES
+print(area_stats)
+write.csv(area_stats, paste0(out, "Ensemble_area_statistics.csv"), row.names = FALSE)
+
+write.csv(data.frame(
+  Class = c("High model consensus (low inter-model disagreement)", "Moderate inter-model disagreement",
+            "High inter-model disagreement", "Very high inter-model disagreement"),
+  SD_min = c(0, 0.10, 0.20, 0.30), SD_max = c(0.10, 0.20, 0.30, Inf),
+  Note = "SD = standard deviation across algorithm-specific suitability maps (inter-model disagreement). Operational, predefined cut-offs; not a statistical confidence or formal uncertainty estimate."),
+  paste0(out, "Uncertainty_class_cutoffs.csv"), row.names = FALSE)
+
+
+# ============================================================================
+# 24. BINARY MAP — threshold from ENSEMBLE OOF prediction (R13)
+# ============================================================================
+
+cat("\n=== Binary map ===\n")
+thr_ens <- sc_main$ens_thr
+cat("  Ensemble max-TSS threshold (pooled OOF):", round(thr_ens, 3), "\n")
+ens_bin <- ifel(ens >= thr_ens, 1L, 0L)
+writeRaster(ens_bin, paste0(out, "Map_Ensemble_binary.tif"), overwrite = TRUE)
+suitable_area <- area_km2(ens_bin == 1L)
+write.csv(data.frame(Species = SPECIES, Threshold = round(thr_ens, 3),
+                     Threshold_source = "Max-TSS on pooled out-of-fold ensemble prediction",
+                     Suitable_area_km2 = suitable_area,
+                     Pct_WG = round(100 * suitable_area / total_area_km2, 2)),
+          paste0(out, "Binary_map_statistics.csv"), row.names = FALSE)
+
+
+# ============================================================================
+# 25. SURVEILLANCE PRIORITY ZONES + SD SENSITIVITY
+# ============================================================================
+
+cat("\n=== Surveillance priority zones ===\n")
+unc_r <- sc_main$ens_sd
+ev_v <- values(ens, mat = FALSE); uv_v <- values(unc_r, mat = FALSE)
+both_ok <- !is.na(ev_v) & !is.na(uv_v)
+q <- function(x, p) round(quantile(x, p, na.rm = TRUE), 4)
+prio_diag <- data.frame(Check = c(
+  "Ensemble and SD rasters share geometry", "Valid cells: ensemble", "Valid cells: SD", "Valid cells in both",
+  "Suitability min / median / max", "Suitability Q90 / Q99",
+  "SD min / median / max", "SD Q05 / Q10 / Q25",
+  paste0("Cells with suitability >= ", HIGH_SUIT), paste0("Cells with SD < ", SD_PRIMARY),
+  "Cells meeting BOTH criteria", paste0("Fraction of high-suitability cells with SD < ", SD_PRIMARY)),
+  Value = c(isTRUE(compareGeom(ens, unc_r, stopOnError = FALSE)), sum(!is.na(ev_v)), sum(!is.na(uv_v)), sum(both_ok),
+            paste(round(range(ev_v, na.rm = TRUE)[1], 4), round(median(ev_v, na.rm = TRUE), 4), round(range(ev_v, na.rm = TRUE)[2], 4), sep = " / "),
+            paste(q(ev_v, 0.90), q(ev_v, 0.99), sep = " / "),
+            paste(round(range(uv_v, na.rm = TRUE)[1], 4), round(median(uv_v, na.rm = TRUE), 4), round(range(uv_v, na.rm = TRUE)[2], 4), sep = " / "),
+            paste(q(uv_v, 0.05), q(uv_v, 0.10), q(uv_v, 0.25), sep = " / "),
+            sum(ev_v >= HIGH_SUIT, na.rm = TRUE), sum(uv_v < SD_PRIMARY, na.rm = TRUE),
+            sum(ev_v >= HIGH_SUIT & uv_v < SD_PRIMARY, na.rm = TRUE),
+            round(sum(ev_v >= HIGH_SUIT & uv_v < SD_PRIMARY, na.rm = TRUE) / max(1, sum(ev_v >= HIGH_SUIT, na.rm = TRUE)), 3)))
+cat("\n  === PRIORITY-ZONE DIAGNOSTICS ===\n"); print(prio_diag, row.names = FALSE)
+write.csv(prio_diag, paste0(out, "Priority_diagnostics.csv"), row.names = FALSE)
+if (sum(ev_v >= HIGH_SUIT & uv_v < SD_PRIMARY, na.rm = TRUE) == 0)
+  cat("  NOTE: no cell meets both criteria - priority area is 0 km2 under the primary cut-offs.\n",
+      "        Inspect SD quantiles above; inter-model SD may exceed the operational cut-off everywhere.\n")
+
+# data-driven alternative: SD cut-offs defined as quantiles of the SD surface itself
+sd_q <- quantile(uv_v, c(0.10, 0.25, 0.50), na.rm = TRUE)
+prio_q <- do.call(rbind, lapply(c(0.5, 0.6, 0.7), function(a) do.call(rbind, lapply(seq_along(sd_q), function(k) {
+  ar <- area_km2(ens >= a & unc_r <= sd_q[k])
+  data.frame(Suit_cutoff = a, SD_quantile = names(sd_q)[k], SD_value = round(sd_q[k], 4), Area_km2 = ar,
+             Pct_WG = round(100 * ar / total_area_km2, 3)) }))))
+print(prio_q, row.names = FALSE)
+write.csv(prio_q, paste0(out, "Priority_zone_SD_quantile_grid.csv"), row.names = FALSE)
+
+priority <- ifel(ens >= HIGH_SUIT & unc_r < SD_PRIMARY, 1L, 0L)
+writeRaster(priority, paste0(out, "Map_Surveillance_priority.tif"), overwrite = TRUE)
+pa <- area_km2(priority == 1L)
+write.csv(data.frame(Species = SPECIES, Suit_threshold = HIGH_SUIT, SD_threshold = SD_PRIMARY,
+                     Priority_area_km2 = pa, Pct_WG = round(100 * pa / total_area_km2, 3)),
+          paste0(out, "Surveillance_priority_statistics.csv"), row.names = FALSE)
+
+sens_df <- dplyr::bind_rows(lapply(c(0.05, 0.10, 0.15, 0.20), function(s) {
+  p <- ifel(ens >= HIGH_SUIT & unc_r < s, 1L, 0L)
+  writeRaster(p, paste0(out, "Map_Priority_SD", round(s * 100), ".tif"), overwrite = TRUE)
+  a <- area_km2(p == 1L)
+  data.frame(SD_threshold = s, Priority_area_km2 = a, Pct_WG = round(100 * a / total_area_km2, 3))
+}))
+print(sens_df)
+write.csv(sens_df, paste0(out, "Priority_zone_SD_sensitivity.csv"), row.names = FALSE)
+p_sp <- ggplot(sens_df, aes(SD_threshold, Priority_area_km2)) +
+  geom_line(colour = "#d73027", linewidth = 1.2) + geom_point(size = 3, colour = "#d73027") +
+  geom_text(aes(label = paste0(Priority_area_km2, " km2\n(", Pct_WG, "%)")), vjust = -0.8, size = 3.5) +
+  geom_vline(xintercept = SD_PRIMARY, linetype = "dashed", colour = "grey50") +
+  scale_x_continuous(breaks = sens_df$SD_threshold) +
+  labs(title = paste0("Priority Zone Sensitivity — H. ", SPECIES),
+       subtitle = paste0("Suitability cut-off fixed at ", HIGH_SUIT, " (operational); inter-model SD (consensus) cut-off varied"),
+       x = "Inter-model SD threshold", y = "Priority area (km2)") +
+  theme_bw(base_size = 13)
+save_gg(p_sp, paste0(out, "Priority_zone_SD_sensitivity.png"), 7, 5)
+
+
+# ---- Priority-zone sensitivity to BOTH cut-offs, both background scenarios (Issue C) ----
+suit_grid <- c(0.5, 0.6, 0.7, 0.8); sd_grid <- c(0.05, 0.10, 0.15, 0.20)
+grid_one <- function(sc, lab) {
+  e <- sc$ens_wt; u <- sc$ens_sd
+  g <- do.call(rbind, lapply(suit_grid, function(a) do.call(rbind, lapply(sd_grid, function(b) {
+    ar <- area_km2(e >= a & u < b)
+    data.frame(Scenario = lab, Suit_cutoff = a, SD_cutoff = b, Area_km2 = ar,
+               Pct_WG = round(100 * ar / total_area_km2, 3))
+  }))))
+  prim <- g$Area_km2[g$Suit_cutoff == HIGH_SUIT & g$SD_cutoff == SD_PRIMARY]
+  g$Rel_to_primary <- round(g$Area_km2 / prim, 2)
+  g
+}
+grid_df <- rbind(grid_one(sc_main, "KDE_inverse"), grid_one(sc_rand, "Random"))
+write.csv(grid_df, paste0(out, "Priority_zone_cutoff_grid.csv"), row.names = FALSE)
+p_grid <- ggplot(grid_df, aes(factor(SD_cutoff), factor(Suit_cutoff), fill = Area_km2)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = paste0(Area_km2, "\n(", Pct_WG, "%)")), size = 3) +
+  facet_wrap(~Scenario) + scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = paste0("Priority-zone area under alternative cut-offs — H. ", SPECIES),
+       subtitle = "Operational cut-offs (not validated biological thresholds); primary = 0.7 / 0.10",
+       x = "Inter-model SD cut-off (<)", y = "Suitability cut-off (>=)", fill = "km2") +
+  theme_bw(base_size = 12)
+save_gg(p_grid, paste0(out, "Priority_zone_cutoff_grid.png"), 10, 5)
+
+
+# ============================================================================
+# 26. SPECIES COMPARISON + OVERLAP (common mask; R15/R16)
+# ============================================================================
+
+cat("\n=== Species comparison ===\n")
+out_sp1 <- dir
+out_sp2 <- dir
+ens_sp1 <- paste0(out_sp1, "Map_Ensemble_weighted.tif")
+ens_sp2 <- paste0(out_sp2, "Map_Ensemble_weighted.tif")
+
+if (file.exists(ens_sp1) && file.exists(ens_sp2)) {
+  s1 <- rast(ens_sp1); s2 <- rast(ens_sp2)
+  if (!isTRUE(compareGeom(s1, s2, stopOnError = FALSE))) s2 <- resample(s2, s1, method = "bilinear")
+  common <- !is.na(s1) & !is.na(s2)
+  s1 <- ifel(common, s1, NA); s2 <- ifel(common, s2, NA)
+  
+  read_thr <- function(d) {
+    f <- paste0(d, "Binary_map_statistics.csv")
+    if (!file.exists(f)) stop("Missing ", f, " — run that species first")
+    
+    tab <- read.csv(f)
+    thr <- tab$Threshold[1]
+    
+    if (!is.finite(thr)) stop("Invalid threshold in: ", f)
+    thr
+  }
+  
+  thr1 <- read_thr(out_sp1)
+  thr2 <- read_thr(out_sp2)
+  
+  options(digits = 15)
+  cat("Full-precision thresholds: sp1 =", format(thr1, digits = 15),
+      "| sp2 =", format(thr2, digits = 15), "\n")
+  cat("  Thresholds (ensemble OOF): sp1 =", thr1, "| sp2 =", thr2, "\n")
+  
+  ca_ov  <- cellSize(s1, unit = "km", mask = TRUE)
+  tot_ov <- global(ca_ov, "sum", na.rm = TRUE)[[1]]
+  ov_area <- function(cond) {
+    v <- global(ifel(cond, ca_ov, 0), "sum", na.rm = TRUE)[[1]]
+    if (!is.finite(v)) 0 else round(v, 0)
+  }
+  
+  overlap <- ifel(s1 >= thr1, 1L, 0L) + 2L * ifel(s2 >= thr2, 1L, 0L)
+  writeRaster(overlap, paste0(out, "Map_species_overlap.tif"), overwrite = TRUE)
+  
+  ov_stats <- data.frame(Class = c("Neither suitable","H. spinigera only","H. turturis only","Both suitable"),
+                         Code = 0:3)
+  ov_stats$Area_km2 <- sapply(0:3, function(k) ov_area(overlap == k))
+  ov_stats$Pct_common_WG <- round(100 * ov_stats$Area_km2 / tot_ov, 2)
+  print(ov_stats)
+  cat("  Sum check:", sum(ov_stats$Area_km2), "vs common-mask total:", round(tot_ov, 0), "km2\n")
+  write.csv(ov_stats, paste0(out, "Species_overlap_statistics.csv"), row.names = FALSE)
+  
+  a1 <- ov_stats$Area_km2[2] + ov_stats$Area_km2[4]; a2 <- ov_stats$Area_km2[3] + ov_stats$Area_km2[4]
+  ab <- ov_stats$Area_km2[4]
+  v  <- values(c(s1, s2), na.rm = TRUE)
+  p1 <- v[,1] / sum(v[,1]); p2 <- v[,2] / sum(v[,2])
+  overlap_idx <- data.frame(
+    Metric = c("Common-mask total area (km2, denominator for % classes)", "Jaccard (binary)",
+               "Sorensen (binary)", "Schoener's D (suitability surfaces)", "Pearson r (suitability surfaces)"),
+    Value = c(round(tot_ov, 0), round(ab / (a1 + a2 - ab), 3), round(2 * ab / (a1 + a2), 3),
+              round(1 - 0.5 * sum(abs(p1 - p2)), 3), round(cor(v[,1], v[,2]), 3)))
+  print(overlap_idx, row.names = FALSE)
+  write.csv(overlap_idx, paste0(out, "Species_overlap_indices.csv"), row.names = FALSE)
+  
+  ov_df <- as.data.frame(overlap, xy = TRUE); names(ov_df)[3] <- "class"
+  ov_df <- ov_df[!is.na(ov_df$class), ]
+  ov_df$class_label <- factor(ov_df$class, levels = 0:3,
+                              labels = c("Neither","H. spinigera only","H. turturis only","Both species"))
+  p_ov <- ggplot() +
+    geom_sf(data = wg, fill = "grey92", colour = "grey60", linewidth = 0.3) +
+    geom_raster(data = ov_df, aes(x, y, fill = class_label)) +
+    scale_fill_manual(values = c("Neither" = "grey92", "H. spinigera only" = "#1f78b4",
+                                 "H. turturis only" = "#33a02c", "Both species" = "#e31a1c"),
+                      name = "Predicted habitat") +
+    labs(title = "Haemaphysalis spp. — Predicted suitability overlap",
+         subtitle = paste0("Both = ", ov_stats$Area_km2[4], " km2 (", ov_stats$Pct_common_WG[4],
+                           "% of common WG area)")) +
+    theme_bw(base_size = 13) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+  save_gg(p_ov, paste0(out, "Map_species_overlap_plot.png"), 7, 9)
+  
+  perf1 <- tryCatch(read.csv(paste0(out_sp1, "Model_summary_table.csv")) %>% dplyr::mutate(Species = "H. spinigera"), error = function(e) NULL)
+  perf2 <- tryCatch(read.csv(paste0(out_sp2, "Model_summary_table.csv")) %>% dplyr::mutate(Species = "H. turturis"), error = function(e) NULL)
+  if (!is.null(perf1) && !is.null(perf2)) {
+    pb <- rbind(perf1, perf2)
+    write.csv(pb, paste0(out, "Species_model_comparison.csv"), row.names = FALSE)
+    p_comp <- ggplot(pb, aes(Model, AUC_mean, fill = Species, ymin = AUC_mean - AUC_SD, ymax = AUC_mean + AUC_SD)) +
+      geom_bar(stat = "identity", position = position_dodge(0.7), width = 0.6, colour = "white") +
+      geom_errorbar(position = position_dodge(0.7), width = 0.2, linewidth = 0.7) +
+      scale_fill_manual(values = c("H. spinigera" = "#1f78b4", "H. turturis" = "#33a02c")) +
+      scale_y_continuous(limits = c(0, 1.05), breaks = seq(0, 1, 0.1)) +
+      geom_hline(yintercept = 0.7, linetype = "dashed", colour = "red") +
+      labs(title = "Model Performance — H. spinigera vs H. turturis",
+           subtitle = "AUC mean \u00b1 SD across 5 spatial CV folds", x = NULL, y = "AUC") +
+      theme_bw(base_size = 13) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+    save_gg(p_comp, paste0(out, "Species_AUC_comparison.png"), 8, 5)
+  }
+} else cat("  Run both species first\n")
+
+
+
+
